@@ -1,0 +1,6 @@
+.venv/
+.failure-kb/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.tmp

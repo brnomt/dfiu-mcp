@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dfiu"
+version = "2.0.0"
+description = "DFIU (Don't F*ck It Up): servidor MCP local de fallos e invariantes de pre-flight"
+requires-python = ">=3.11"
+dependencies = ["mcp==1.30.0"]
+
+[tool.setuptools]
+py-modules = ["server"]
