@@ -4,7 +4,7 @@ Local knowledge base for failures you have already paid for. An agent records an
 
 DFIU is a single-process [MCP](https://modelcontextprotocol.io) server. It speaks stdio, stores everything in SQLite, and does not open a socket, call a model, or apply a fix. Detection stays cheap. The long write-up of an incident is fetched later, by id, and only if something matched.
 
-The contract lives in [`mcp_failure_preflight_spec_v2.md`](mcp_failure_preflight_spec_v2.md). This repository is the MVP of sections 1–12 of that spec: one module, [`server.py`](server.py), version 2.0.0.
+The product is [`server.py`](server.py), version 2.0.0. `dfiu serve` is how an editor launches it.
 
 ## What it is for
 
@@ -149,7 +149,7 @@ The fingerprint is declared at activation as a list of repo-relative files. It i
 
 ### Artifacts
 
-`compile_artifacts` writes two files under `FAILURE_KB_ARTIFACTS` (default `.failure-kb/artifacts`):
+`compile_artifacts` writes two files under `FAILURE_KB_ARTIFACTS` (default `.dfiu/artifacts`):
 
 - `invariants.json` — canonical. Sorted keys, two-space indent, UTF-8, LF, trailing newline. No timestamp. `artifact_sha256` is the sha256 of those exact bytes. Rules are ordered by `scope`, then `id`.
 - `active_rules.md` — one line per rule: `- [severity] `id` (scope): invariant -> action`.
@@ -169,19 +169,18 @@ server.py                          the server
 cli.py                             dfiu install / dfiu serve
 test_mvp.py                        unittest suite
 test_install.py                    config merge tests
-mcp_failure_preflight_spec_v2.md   the contract
 requirements.txt                   mcp==1.30.0
 requirements.lock                  same pin, for the reason below
 ```
 
-SQLite lives at `$FAILURE_KB_DIR/kb.sqlite3` (default `.failure-kb/kb.sqlite3`). The directory is mode `0700`, the database file `0600`. Connections use `foreign_keys=ON`, `journal_mode=WAL`, and `busy_timeout=5000`. Each write takes one connection and one `BEGIN IMMEDIATE`, stamps every row with a single UTC timestamp, and closes the connection when it finishes. Schema changes are ordered SQL strings applied through `PRAGMA user_version`.
+SQLite lives at `$FAILURE_KB_DIR/kb.sqlite3` (default `.dfiu/kb.sqlite3`). The directory is mode `0700`, the database file `0600`. Connections use `foreign_keys=ON`, `journal_mode=WAL`, and `busy_timeout=5000`. Each write takes one connection and one `BEGIN IMMEDIATE`, stamps every row with a single UTC timestamp, and closes the connection when it finishes. Schema changes are ordered SQL strings applied through `PRAGMA user_version`.
 
 | Variable | Default | Role |
 | --- | --- | --- |
-| `FAILURE_KB_DIR` | `.failure-kb` | Database directory. Relative paths follow the process cwd. |
-| `FAILURE_KB_ARTIFACTS` | `.failure-kb/artifacts` | Fixed output directory. The model never chooses this path. |
+| `FAILURE_KB_DIR` | `.dfiu` | Database directory. Relative paths follow the process cwd. |
+| `FAILURE_KB_ARTIFACTS` | `.dfiu/artifacts` | Fixed output directory. The model never chooses this path. |
 
-**Git policy B** (this repo): `.failure-kb/` is gitignored, database included. Artifacts are regenerated with `compile_artifacts`. The database is never committed. Policy A (version the two artifact files and fail CI on drift) is described in the spec and is not what this tree does.
+**Git policy B** (this repo): `.dfiu/` is gitignored, database included. Artifacts are regenerated with `compile_artifacts`. The database is never committed. Policy A, versioning the two artifact files and failing CI on drift, is not what this tree does.
 
 ## Install
 
@@ -229,16 +228,12 @@ A typical agent loop:
 .venv/bin/python -m unittest test_mvp test_install
 ```
 
-`test_mvp.py` walks the happy path: record, verify, activate, preflight, artifacts, idempotency, and the git-union behavior on ASCII paths. It does not cover the gaps below. `test_install.py` checks that install and uninstall touch only the `dfiu` entry.
+`test_mvp.py` walks the happy path: record, verify, activate, preflight, artifacts, idempotency, and the git-union behavior on ASCII paths. `test_install.py` checks that install and uninstall touch only the `dfiu` entry.
 
-## Contract vs. this tree
-
-`server.py` is the source of truth where it deliberately departs from the spec's reference block:
+## What the server guarantees
 
 1. Zero evaluable rules returns `no_coverage`, never `clear`.
 2. `files_touched` and `change_type` are unioned with the git diff of the cwd, and only when cwd is the work-tree root. A parent repo is not adopted.
 3. `hypothesis` and `verified` come back as `hypothesis_matches` at severity `info` and do not block.
 4. The same directory, or the same `error_code` family, comes back as `variant_matches`.
 5. Each preflight is logged. `record_failure` marks those rows `recurred`. `preflight_stats` returns the counts.
-
-[`dfiu-cli-design.md`](dfiu-cli-design.md) is a sketch for a future `dfiu` command (install, project discovery, git hooks). None of that is implemented. Today the product is `python server.py`.

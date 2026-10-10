@@ -1,5 +1,5 @@
 .venv/
-.failure-kb/
+.dfiu/
 __pycache__/
 *.py[cod]
 .pytest_cache/

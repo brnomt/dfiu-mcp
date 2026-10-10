@@ -52,7 +52,7 @@ class Ids:
 
     def __call__(self) -> uuid.UUID:
         self.n += 1
-        # hex[:12] es el id de regla; el contador va en los bits altos.
+        # hex[:12] is the rule id; the counter lives in the high bits.
         return uuid.UUID(int=self.n << 96)
 
 
@@ -135,10 +135,10 @@ class MVP(unittest.TestCase):
         self.assertEqual(server.DB.stat().st_mode & 0o777, 0o600)
 
     def test_compiler_is_deterministic(self) -> None:
-        rec = self.record(proposed_action="revisar cañón", scope="zeta")
+        rec = self.record(proposed_action="check cañón", scope="zeta")
         self.verify(rec["incident_id"], rec["rule_id"])
         self.activate(rec["rule_id"])
-        other = self.record(scope="alpha", proposed_invariant="otra regla",
+        other = self.record(scope="alpha", proposed_invariant="other rule",
                             proposed_action="parar", severity="info",
                             condition={"op": "eq", "field": "project", "value": PROJECT})
         self.verify(other["incident_id"], other["rule_id"])
@@ -174,15 +174,15 @@ class MVP(unittest.TestCase):
         self.assertLessEqual(len(zeta["incident_ids"]), 5)
         line = (server.ARTIFACT_DIR / "active_rules.md").read_text().splitlines()[2]
         self.assertTrue(line.startswith("- [info] `"))
-        bare = server.compile_artifacts("vacio")
-        self.record(proposed_invariant="cambia el hash", proposed_action="x", scope="otro")
-        # hypothesis no entra; un cambio semántico de reglas activas sí
-        self.assertEqual(server.compile_artifacts("vacio")["artifact_sha256"], bare["artifact_sha256"])
-        added = self.record(project="vacio", proposed_invariant="cambia", proposed_action="x",
-                            scope="s", condition={"op": "eq", "field": "project", "value": "vacio"})
+        bare = server.compile_artifacts("empty")
+        self.record(proposed_invariant="changes the hash", proposed_action="x", scope="other")
+        # a hypothesis is not compiled; a semantic change to an active rule is
+        self.assertEqual(server.compile_artifacts("empty")["artifact_sha256"], bare["artifact_sha256"])
+        added = self.record(project="empty", proposed_invariant="changes", proposed_action="x",
+                            scope="s", condition={"op": "eq", "field": "project", "value": "empty"})
         self.verify(added["incident_id"], added["rule_id"])
         self.activate(added["rule_id"])
-        self.assertNotEqual(server.compile_artifacts("vacio")["artifact_sha256"], bare["artifact_sha256"])
+        self.assertNotEqual(server.compile_artifacts("empty")["artifact_sha256"], bare["artifact_sha256"])
 
     def test_grammar(self) -> None:
         s = {
@@ -205,7 +205,7 @@ class MVP(unittest.TestCase):
             ({"op": "touches_any", "field": "files_touched", "value": ["nope/*"]}, False),
             ({"op": "touches_all", "field": "files_touched", "value": ["deploy/*", "src/*"]}, True),
             ({"op": "touches_all", "field": "files_touched", "value": ["deploy/*", "missing/*"]}, False),
-            ({"op": "touches_all", "field": "files_touched", "value": ["deploy/*"]}, False),  # relleno abajo
+            ({"op": "touches_all", "field": "files_touched", "value": ["deploy/*"]}, False),  # filler, not evaluated here
         ]
         empty = dict(s, files_touched=[])
         trace: list[str] = []
@@ -341,7 +341,7 @@ class MVP(unittest.TestCase):
         self.assertEqual(pf["matches"], [])
         self.assertEqual(pf["stale_matches"][0]["rule_id"], rid)
         self.assertEqual(pf["status"], "alert")
-        self.assertEqual(self.q("SELECT stale_reason FROM rules WHERE id=?", (rid,))[0][0], "valid_until vencido")
+        self.assertEqual(self.q("SELECT stale_reason FROM rules WHERE id=?", (rid,))[0][0], "valid_until expired")
         self.assertEqual(self.activate(rid)["error"]["code"], "verification_required")
         self.clock.advance()
         self.assertEqual(self.verify(rec["incident_id"], rid)["rule_status"], "stale")
@@ -351,7 +351,7 @@ class MVP(unittest.TestCase):
         pin = Path("dep/pin.txt")
         pin.parent.mkdir()
         pin.write_bytes(b"v1")
-        dep = self.record(proposed_invariant="depende del pin", scope="deps",
+        dep = self.record(proposed_invariant="depends on the pin", scope="deps",
                           condition={"op": "eq", "field": "project", "value": PROJECT})
         self.verify(dep["incident_id"], dep["rule_id"])
         self.activate(dep["rule_id"], dependency_paths=["./dep/pin.txt"])
@@ -360,18 +360,18 @@ class MVP(unittest.TestCase):
         self.assertNotIn(dep["rule_id"], [m["rule_id"] for m in pf["matches"]])
         self.assertIn(dep["rule_id"], [m["rule_id"] for m in pf["stale_matches"]])
         self.assertEqual(self.q("SELECT stale_reason FROM rules WHERE id=?", (dep["rule_id"],))[0][0],
-                         "dependencias cambiaron")
+                         "dependencies changed")
         rev = self.record(proposed_invariant="review after", scope="rev")
         self.verify(rev["incident_id"], rev["rule_id"])
         self.activate(rev["rule_id"], review_after=past)
         server.list_active_invariants(PROJECT)
         status, reason = self.q("SELECT status, stale_reason FROM rules WHERE id=?", (rev["rule_id"],))[0]
-        self.assertEqual((status, reason), ("stale", "review_after vencido"))
-        gone = self.record(proposed_invariant="se depreca", scope="old")
+        self.assertEqual((status, reason), ("stale", "review_after expired"))
+        gone = self.record(proposed_invariant="will deprecate", scope="old")
         self.verify(gone["incident_id"], gone["rule_id"])
         self.activate(gone["rule_id"])
-        self.assertEqual(server.deprecate_rule(gone["rule_id"], "obsoleta", "ana")["status"], "deprecated")
-        self.assertEqual(server.deprecate_rule(gone["rule_id"], "otra", "ana")["error"]["code"],
+        self.assertEqual(server.deprecate_rule(gone["rule_id"], "obsolete", "ana")["status"], "deprecated")
+        self.assertEqual(server.deprecate_rule(gone["rule_id"], "again", "ana")["error"]["code"],
                          "illegal_transition")
         compiled = json.loads(server.compile_artifacts(PROJECT)["files"] and
                               (server.ARTIFACT_DIR / "invariants.json").read_text())
@@ -423,16 +423,16 @@ class MVP(unittest.TestCase):
     def test_secrets(self) -> None:
         self.assertEqual(set(SECRETS), {k for k, _ in server.SECRET_PATTERNS})
         for kind, secret in SECRETS.items():
-            text, found = server.redact(f"antes {secret} despues")
+            text, found = server.redact(f"before {secret} after")
             self.assertEqual(found, [kind], kind)
             self.assertNotIn(secret, text)
             again, found2 = server.redact(text)
             self.assertEqual(again, text)
             self.assertEqual(found2, [])
-            rec = self.record(title=f"t {kind}", symptom=f"antes {secret} despues",
+            rec = self.record(title=f"t {kind}", symptom=f"before {secret} after",
                               proposed_invariant=f"inv {kind}", proposed_action="x", scope=kind)
             self.assertTrue(rec["ok"], rec)
-            self.assertTrue(any(f"redactado {kind}" in w for w in rec["warnings"]))
+            self.assertTrue(any(f"redacted {kind}" in w for w in rec["warnings"]))
             blob = " ".join(rec["warnings"])
             self.assertNotIn(secret, blob)
             detail = server.get_incident_details(rec["incident_id"])
@@ -445,9 +445,9 @@ class MVP(unittest.TestCase):
             if art["written"]:
                 for path in server.ARTIFACT_DIR.iterdir():
                     self.assertNotIn(secret.encode(), path.read_bytes(), kind)
-        noisy = self.record(symptom=f"visto {ENTROPY} en el log", proposed_invariant="entropia",
+        noisy = self.record(symptom=f"saw {ENTROPY} in the log", proposed_invariant="entropy",
                             proposed_action="x", scope="entropy")
-        self.assertTrue(any("alta entropía" in w for w in noisy["warnings"]))
+        self.assertTrue(any("high-entropy" in w for w in noisy["warnings"]))
         self.assertNotIn(ENTROPY, " ".join(noisy["warnings"]))
         self.assertEqual(noisy["ok"] and self.q(
             "SELECT sensitivity FROM incidents WHERE id=?", (noisy["incident_id"],))[0][0], "normal")
@@ -503,7 +503,7 @@ class MVP(unittest.TestCase):
             stale = server.preflight_check(self.summary())
             self.assertEqual(stale["matches"], [])
             self.assertEqual(stale["stale_matches"][0]["rule_id"], rec["rule_id"])
-            self.assertEqual(server.deprecate_rule(rec["rule_id"], "ya no", "ana")["status"], "deprecated")
+            self.assertEqual(server.deprecate_rule(rec["rule_id"], "no longer", "ana")["status"], "deprecated")
             compiled = server.compile_artifacts(PROJECT)
             self.assertEqual(compiled["rule_count"], 0)
             self.assertNotIn(rec["rule_id"], (server.ARTIFACT_DIR / "invariants.json").read_text())
@@ -537,13 +537,13 @@ class MVP(unittest.TestCase):
             condition={"op": "touches_any", "field": "files_touched", "value": ["deploy/a.yaml"]},
         )
         coded = self.record(
-            proposed_invariant="el codigo del diff", scope="code",
+            proposed_invariant="code from the diff", scope="code",
             condition={"op": "any_in", "field": "change_type", "value": ["code"]},
         )
         self.verify(coded["incident_id"], coded["rule_id"])
         self.activate(coded["rule_id"])
         fam = self.record(
-            proposed_invariant="familia de error", scope="err",
+            proposed_invariant="error family", scope="err",
             condition={"op": "eq", "field": "error_code", "value": "ERR_CONN_RESET"},
         )
         env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
@@ -564,10 +564,10 @@ class MVP(unittest.TestCase):
         self.assertIn("deploy/b.yaml", pf["git_files"])
         self.assertIn(coded["rule_id"], [m["rule_id"] for m in pf["matches"]])
         self.assertEqual(next(m["note"] for m in pf["variant_matches"] if m["rule_id"] == near["rule_id"]),
-                         "mismo directorio")
+                         "same directory")
         self.assertIn(fam["rule_id"], [m["rule_id"] for m in pf["variant_matches"]])
         self.assertEqual(next(m["note"] for m in pf["variant_matches"] if m["rule_id"] == fam["rule_id"]),
-                         "error_code emparentado")
+                         "related error_code")
         self.assertNotIn(near["rule_id"], [m["rule_id"] for m in pf["matches"]])
 
     def test_stdio_startup(self) -> None:

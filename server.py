@@ -1,4 +1,4 @@
-# server.py — DFIU v2 (MVP). Local, stdio, sin red ni LLM.
+# server.py — DFIU v2 (MVP). Local stdio server. No network, no LLM.
 from __future__ import annotations
 
 import fnmatch
@@ -17,15 +17,15 @@ from typing import Any, Iterator
 
 from mcp.server.fastmcp import FastMCP
 
-KB_DIR = Path(os.environ.get("FAILURE_KB_DIR", ".failure-kb"))
+KB_DIR = Path(os.environ.get("FAILURE_KB_DIR", ".dfiu"))
 DB = KB_DIR / "kb.sqlite3"
-ARTIFACT_DIR = Path(os.environ.get("FAILURE_KB_ARTIFACTS", ".failure-kb/artifacts"))
+ARTIFACT_DIR = Path(os.environ.get("FAILURE_KB_ARTIFACTS", ".dfiu/artifacts"))
 SCHEMA_VERSION = 1
 CHANGE_SUMMARY_VERSION = 1
 MAX_DEPTH = 4
 MAX_NODES = 32
 MAX_MATCHES = 5
-ENTROPY_THRESHOLD = 4.0      # bits/carácter, candidatos >= 20 caracteres
+ENTROPY_THRESHOLD = 4.0      # bits/char, candidates at least 20 characters
 ENTROPY_MIN_LEN = 20
 CHANGE_TYPES = {"code", "config", "dependency", "schema", "infra", "firmware", "docs", "test"}
 SEVERITIES = {"info", "warning", "blocker"}
@@ -33,7 +33,7 @@ SEVERITIES = {"info", "warning", "blocker"}
 mcp = FastMCP("dfiu")
 
 
-# ---------- errores estructurados ----------
+# ---------- structured errors ----------
 class KBError(Exception):
     def __init__(self, code: str, message: str, fields: list[str] | None = None):
         super().__init__(message)
@@ -45,7 +45,7 @@ class KBError(Exception):
 
 
 def tool_guard(fn):
-    """Convierte KBError y fallos inesperados en el formato de error estándar."""
+    """Turn KBError and unexpected failures into the standard error object."""
     import functools
 
     @functools.wraps(fn)
@@ -55,13 +55,13 @@ def tool_guard(fn):
         except KBError as e:
             return e.to_dict()
         except sqlite3.IntegrityError:
-            return KBError("conflict", "Violación de integridad").to_dict()
-        except Exception:  # no exponer trazas, rutas ni SQL
+            return KBError("conflict", "Integrity violation").to_dict()
+        except Exception:  # never return a traceback, path, or SQL
             return KBError("internal", "Error interno").to_dict()
     return wrapper
 
 
-# ---------- utilidades ----------
+# ---------- utilities ----------
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
@@ -77,11 +77,11 @@ def sha256(text: str) -> str:
 
 def bounded(name: str, value: str, limit: int) -> str:
     if len(value) > limit:
-        raise KBError("too_large", f"{name} excede {limit} caracteres", [name])
+        raise KBError("too_large", f"{name} exceeds {limit} characters", [name])
     return value
 
 
-# ---------- secretos (capa de servicio, antes de persistir y al responder) ----------
+# ---------- secrets (scrub before storing and again on the way out) ----------
 SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("private_key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(-----END [A-Z ]*PRIVATE KEY-----|$)")),
     ("aws_access_key", re.compile(r"\b(AKIA|ASIA)[0-9A-Z]{16}\b")),
@@ -104,7 +104,7 @@ def shannon(s: str) -> float:
 
 
 def _replace_outside_markers(text: str, pat: re.Pattern[str], repl) -> str:
-    """El marcador ya redactado no se vuelve a escanear."""
+    """Skip text that is already inside a redaction marker."""
     parts: list[str] = []
     last = 0
     for mark in REDACTED.finditer(text):
@@ -116,8 +116,8 @@ def _replace_outside_markers(text: str, pat: re.Pattern[str], repl) -> str:
 
 
 def redact(text: str) -> tuple[str, list[str]]:
-    """Redacta coincidencias de alta confianza; devuelve (texto, tipos_detectados).
-    Idempotente: el marcador no vuelve a coincidir."""
+    """Redact high-confidence matches. Returns (text, kinds found).
+    Idempotent: a marker is not scanned again."""
     found: list[str] = []
     for kind, pat in SECRET_PATTERNS:
         def sub(m: re.Match[str], kind: str = kind) -> str:
@@ -132,7 +132,7 @@ def redact(text: str) -> tuple[str, list[str]]:
 
 
 def low_confidence_candidates(text: str) -> int:
-    """Cuenta cadenas de alta entropía no redactadas (no se devuelven ni registran)."""
+    """Count high-entropy strings that were not redacted. The strings themselves are not returned."""
     clean = REDACTED.sub("", text)
     return sum(1 for m in CANDIDATE.finditer(clean) if shannon(m.group(0)) >= ENTROPY_THRESHOLD)
 
@@ -140,13 +140,13 @@ def low_confidence_candidates(text: str) -> int:
 def scrub(name: str, value: str, limit: int, warnings: list[str]) -> str:
     value, kinds = redact(bounded(name, value, limit))
     for k in kinds:
-        warnings.append(f"{name}: redactado {k}")
+        warnings.append(f"{name}: redacted {k}")
     if low_confidence_candidates(value):
-        warnings.append(f"{name}: cadena de alta entropía, revisar (no redactada)")
+        warnings.append(f"{name}: high-entropy string, review (not redacted)")
     return value
 
 
-# ---------- base de datos ----------
+# ---------- database ----------
 MIGRATIONS: list[str] = [
     # v1
     """
@@ -207,7 +207,7 @@ MIGRATIONS: list[str] = [
     CREATE INDEX idx_vlog_rule ON verification_log(rule_id, verdict, created_at DESC);
     CREATE INDEX idx_rt_rule ON rule_transitions(rule_id, created_at);
     """,
-    # v2: medición local de preflight. No sale de la máquina.
+    # v2: local preflight log. Stays on this machine.
     """
     CREATE TABLE preflight_log(
       id TEXT PRIMARY KEY,
@@ -241,7 +241,7 @@ def _open() -> sqlite3.Connection:
 
 @contextmanager
 def tx() -> Iterator[tuple[sqlite3.Connection, str]]:
-    """Una conexión, una transacción IMMEDIATE, un timestamp; siempre cierra."""
+    """One connection, one IMMEDIATE transaction, one timestamp. Always closes."""
     c = _open()
     try:
         c.execute("BEGIN IMMEDIATE")
@@ -272,7 +272,7 @@ def idempotent(c: sqlite3.Connection, tool: str, key: str, request: dict[str, An
     if row is None:
         return None
     if row["request_hash"] != sha256(canonical_json(request)):
-        raise KBError("idempotency_conflict", "idempotency_key reutilizada con otra petición",
+        raise KBError("idempotency_conflict", "idempotency_key reused with a different request",
                       ["idempotency_key"])
     return json.loads(row["response_json"])
 
@@ -288,29 +288,29 @@ def remember(c: sqlite3.Connection, tool: str, key: str, request: dict[str, Any]
 def norm_path(p: str) -> str:
     pp = PurePosixPath(p.replace("\\", "/"))
     if pp.is_absolute() or ".." in pp.parts:
-        raise KBError("invalid_input", f"Ruta fuera del proyecto: {p}", ["files_touched"])
+        raise KBError("invalid_input", f"Path escapes the project: {p}", ["files_touched"])
     s = str(pp)
     return s[2:] if s.startswith("./") else s
 
 
 def normalize_summary(summary: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
-    """Valida ChangeSummaryV1. Devuelve (normalizado, campos_faltantes)."""
+    """Validate a ChangeSummaryV1. Returns (normalized, missing fields)."""
     if summary.get("schema_version") != CHANGE_SUMMARY_VERSION:
-        raise KBError("unsupported_schema", "schema_version desconocida", ["schema_version"])
+        raise KBError("unsupported_schema", "unknown schema_version", ["schema_version"])
     if not isinstance(summary.get("project"), str) or not summary["project"]:
-        raise KBError("invalid_input", "project obligatorio", ["project"])
+        raise KBError("invalid_input", "project is required", ["project"])
     missing = [f for f in ("services", "files_touched", "change_type") if f not in summary]
     out: dict[str, Any] = {"schema_version": 1, "project": summary["project"]}
     for f in ("services", "files_touched", "change_type", "environment_tags"):
         vals = summary.get(f, [])
         if not isinstance(vals, list) or not all(isinstance(v, str) for v in vals) or len(vals) > 200:
-            raise KBError("invalid_input", f"{f} debe ser lista de strings (máx 200)", [f])
+            raise KBError("invalid_input", f"{f} must be a list of strings (max 200)", [f])
         if f == "files_touched":
             vals = [norm_path(v) for v in vals]
         out[f] = sorted(set(vals))
     bad = set(out["change_type"]) - CHANGE_TYPES
     if bad:
-        raise KBError("invalid_input", f"change_type inválido: {sorted(bad)}", ["change_type"])
+        raise KBError("invalid_input", f"invalid change_type: {sorted(bad)}", ["change_type"])
     for f in ("operation", "subsystem", "error_code", "revision", "empty_reason"):
         if summary.get(f) is not None:
             out[f] = bounded(f, str(summary[f]), 200)
@@ -320,7 +320,7 @@ def normalize_summary(summary: dict[str, Any]) -> tuple[dict[str, Any], list[str
     return out, sorted(set(missing))
 
 
-# ---------- gramática condition_json ----------
+# ---------- condition_json grammar ----------
 LIST_FIELDS = {"services", "files_touched", "change_type", "environment_tags"}
 SCALAR_FIELDS = {"project", "operation", "subsystem", "error_code", "revision"}
 LEAF_OPS = {"eq", "in", "prefix", "exists", "touches_any", "touches_all", "any_in"}
@@ -331,30 +331,30 @@ def validate_condition(node: Any, depth: int = 1, count: list[int] | None = None
     count = count if count is not None else [0]
     count[0] += 1
     if depth > MAX_DEPTH or count[0] > MAX_NODES:
-        raise KBError("invalid_condition", f"Condición excede profundidad {MAX_DEPTH} o {MAX_NODES} nodos")
+        raise KBError("invalid_condition", f"Condition exceeds depth {MAX_DEPTH} or {MAX_NODES} nodes")
     if not isinstance(node, dict) or "op" not in node:
-        raise KBError("invalid_condition", "Nodo sin 'op'")
+        raise KBError("invalid_condition", "Node is missing 'op'")
     op = node["op"]
     if op in BOOL_OPS:
         args = node.get("args")
         if not isinstance(args, list) or not args or (op == "not" and len(args) != 1):
-            raise KBError("invalid_condition", f"'{op}' requiere args válidos")
+            raise KBError("invalid_condition", f"'{op}' needs valid args")
         if set(node) != {"op", "args"}:
-            raise KBError("invalid_condition", "Claves extra en nodo booleano")
+            raise KBError("invalid_condition", "Unexpected keys on a boolean node")
         for a in args:
             validate_condition(a, depth + 1, count)
         return
     if op not in LEAF_OPS:
-        raise KBError("invalid_condition", f"Operador no permitido: {op}")
+        raise KBError("invalid_condition", f"Operator not allowed: {op}")
     field = node.get("field")
     if field not in LIST_FIELDS | SCALAR_FIELDS:
-        raise KBError("invalid_condition", f"Campo no permitido: {field}")
+        raise KBError("invalid_condition", f"Field not allowed: {field}")
     if op == "exists":
         if set(node) != {"op", "field"}:
-            raise KBError("invalid_condition", "exists solo admite field")
+            raise KBError("invalid_condition", "exists only accepts field")
         return
     if set(node) != {"op", "field", "value"}:
-        raise KBError("invalid_condition", "Nodo hoja requiere op, field, value")
+        raise KBError("invalid_condition", "A leaf node requires op, field, and value")
     v = node["value"]
     if op in {"eq", "prefix"}:
         ok = field in SCALAR_FIELDS and isinstance(v, str)
@@ -366,7 +366,7 @@ def validate_condition(node: Any, depth: int = 1, count: list[int] | None = None
         if ok and op in {"touches_any", "touches_all"}:
             ok = field == "files_touched" and all(set(x) & set("[]") == set() for x in v)
     if not ok:
-        raise KBError("invalid_condition", f"Tipos inválidos para {op}/{field}")
+        raise KBError("invalid_condition", f"Invalid types for {op}/{field}")
 
 
 class Missing(Exception):
@@ -414,7 +414,7 @@ def evaluate(node: dict[str, Any], s: dict[str, Any], trace: list[str]) -> bool:
     return hit
 
 
-# ---------- reglas ----------
+# ---------- rules ----------
 def rule_hash(project: str, scope: str, condition: dict, invariant: str, action: str,
               severity: str) -> str:
     return sha256(canonical_json({"project": project, "scope": scope, "condition": condition,
@@ -423,8 +423,8 @@ def rule_hash(project: str, scope: str, condition: dict, invariant: str, action:
 
 
 def dependency_fingerprint(paths: list[str], root: Path = Path(".")) -> str:
-    """sha256 sobre 'ruta\\0sha256(contenido)\\n' de cada ruta declarada, ordenadas.
-    Ruta ausente => 'ruta\\0MISSING'. Directorios no se admiten."""
+    """sha256 of 'path\\0sha256(bytes)\\n' for each declared path, sorted.
+    A missing path contributes 'path\\0MISSING'. Directories are not allowed."""
     lines = []
     for p in sorted(set(norm_path(x) for x in paths)):
         f = root / p
@@ -443,7 +443,7 @@ RULE_TRANSITIONS = {
 def transition(c: sqlite3.Connection, rule: sqlite3.Row, to: str, reason: str, actor: str,
                t: str, extra_sql: str = "", extra_args: tuple = ()) -> None:
     if (rule["status"], to) not in RULE_TRANSITIONS:
-        raise KBError("illegal_transition", f"{rule['status']} -> {to} no permitida", ["status"])
+        raise KBError("illegal_transition", f"{rule['status']} -> {to} is not allowed", ["status"])
     c.execute(f"UPDATE rules SET status=?, updated_at=?{extra_sql} WHERE id=?",
               (to, t, *extra_args, rule["id"]))
     c.execute("INSERT INTO rule_transitions VALUES(?,?,?,?,?,?,?,?)",
@@ -454,7 +454,7 @@ def transition(c: sqlite3.Connection, rule: sqlite3.Row, to: str, reason: str, a
 def get_rule(c: sqlite3.Connection, rule_id: str) -> sqlite3.Row:
     row = c.execute("SELECT * FROM rules WHERE id=?", (rule_id,)).fetchone()
     if row is None:
-        raise KBError("not_found", "rule_id no encontrado", ["rule_id"])
+        raise KBError("not_found", "rule_id not found", ["rule_id"])
     return row
 
 
@@ -463,17 +463,17 @@ def refresh_staleness(c: sqlite3.Connection, project: str, t: str) -> None:
     for r in rows:
         reason = None
         if r["valid_until"] and r["valid_until"] <= t:
-            reason = "valid_until vencido"
+            reason = "valid_until expired"
         elif r["review_after"] and r["review_after"] <= t:
-            reason = "review_after vencido"
+            reason = "review_after expired"
         elif r["dependency_fingerprint"] and \
                 dependency_fingerprint(json.loads(r["dependency_paths_json"])) != r["dependency_fingerprint"]:
-            reason = "dependencias cambiaron"
+            reason = "dependencies changed"
         if reason:
             transition(c, r, "stale", reason, "system", t, ", stale_reason=?", (reason,))
 
 
-# ---------- herramientas ----------
+# ---------- tools ----------
 @mcp.tool()
 @tool_guard
 def record_failure(project: str, title: str, symptom: str, subsystem: str = "",
@@ -483,7 +483,7 @@ def record_failure(project: str, title: str, symptom: str, subsystem: str = "",
                    proposed_invariant: str = "", proposed_action: str = "",
                    condition: dict[str, Any] | None = None, scope: str = "",
                    severity: str = "warning", idempotency_key: str = "") -> dict:
-    """Registra un incidente (open) y opcionalmente una regla en hypothesis."""
+    """Open an incident. Optionally attach a hypothesis rule."""
     request = {k: v for k, v in locals().items() if k != "idempotency_key"}
     warnings: list[str] = []
     with tx() as (c, t):
@@ -502,16 +502,16 @@ def record_failure(project: str, title: str, symptom: str, subsystem: str = "",
              condition_hash or None, scrub("suspected_cause", suspected_cause, 1000, warnings) or None,
              scrub("proposed_resolution", proposed_resolution, 1000, warnings) or None, "open",
              scrub("evidence_summary", evidence_summary, 1000, warnings) or None,
-             canonical_json(tags_s), "redacted" if any("redactado" in w for w in warnings) else "normal"))
+             canonical_json(tags_s), "redacted" if any(": redacted " in w for w in warnings) else "normal"))
         rule_id = None
         if proposed_invariant or condition:
             missing = [n for n, v in (("proposed_invariant", proposed_invariant),
                                       ("proposed_action", proposed_action),
                                       ("condition", condition), ("scope", scope)) if not v]
             if missing:
-                raise KBError("invalid_input", "Regla propuesta incompleta", missing)
+                raise KBError("invalid_input", "Proposed rule is incomplete", missing)
             if severity not in SEVERITIES:
-                raise KBError("invalid_input", "severity inválida", ["severity"])
+                raise KBError("invalid_input", "invalid severity", ["severity"])
             validate_condition(condition)
             inv = scrub("proposed_invariant", proposed_invariant, 200, warnings)
             act = scrub("proposed_action", proposed_action, 200, warnings)
@@ -537,15 +537,15 @@ def verify_resolution(incident_id: str, verdict: str, method: str, success_crite
                       evidence_summary: str, rule_id: str = "", environment: str = "",
                       source_revision: str = "", condition_hash: str = "", reviewer: str = "",
                       idempotency_key: str = "") -> dict:
-    """Registra evidencia. Gate: pass solo cuenta con criterio, precondiciones pass y camino ejercitado."""
+    """Append evidence. An effective pass needs a criterion, all preconditions passing, and the failing path exercised."""
     request = {k: v for k, v in locals().items() if k != "idempotency_key"}
     if verdict not in {"pass", "fail", "inconclusive"}:
-        raise KBError("invalid_input", "verdict inválido", ["verdict"])
+        raise KBError("invalid_input", "invalid verdict", ["verdict"])
     if method not in {"test", "reproduction", "regression", "operator_review"}:
-        raise KBError("invalid_input", "method inválido", ["method"])
+        raise KBError("invalid_input", "invalid method", ["method"])
     if not preconditions or any(v not in {"pass", "fail", "inconclusive", "not_run"}
                                 for v in preconditions.values()):
-        raise KBError("invalid_input", "preconditions: {nombre: pass|fail|inconclusive|not_run}",
+        raise KBError("invalid_input", "preconditions: {name: pass|fail|inconclusive|not_run}",
                       ["preconditions"])
     warnings: list[str] = []
     with tx() as (c, t):
@@ -554,19 +554,19 @@ def verify_resolution(incident_id: str, verdict: str, method: str, success_crite
             return cached
         inc = c.execute("SELECT status FROM incidents WHERE id=?", (incident_id,)).fetchone()
         if inc is None:
-            raise KBError("not_found", "incident_id no encontrado", ["incident_id"])
+            raise KBError("not_found", "incident_id not found", ["incident_id"])
         rule = None
         if rule_id:
             rule = get_rule(c, rule_id)
             linked = c.execute("SELECT 1 FROM incident_rules WHERE incident_id=? AND rule_id=?",
                                (incident_id, rule_id)).fetchone()
             if not linked:
-                raise KBError("invalid_input", "rule_id no vinculada al incidente", ["rule_id"])
+                raise KBError("invalid_input", "rule_id is not linked to this incident", ["rule_id"])
         pending = sorted(k for k, v in preconditions.items() if v != "pass")
         if not exercised_failing_path:
             pending.append("exercised_failing_path")
         if method == "operator_review":
-            pending.append("method: operator_review no basta para pass efectivo")
+            pending.append("method: operator_review is not an effective pass")
         if not success_criterion.strip():
             pending.append("success_criterion")
         effective = verdict == "pass" and not pending
@@ -608,22 +608,22 @@ def verify_resolution(incident_id: str, verdict: str, method: str, success_crite
 def activate_rule(rule_id: str, reviewer: str, reason: str, dependency_paths: list[str] | None = None,
                   source_revision: str = "", review_after: str = "", valid_until: str = "",
                   severity: str = "") -> dict:
-    """verified|stale -> active. Requiere reviewer y una verificación efectiva posterior al último cambio."""
+    """Move verified or stale to active. Needs a reviewer and an effective verification after the last change."""
     if not reviewer or not reason:
-        raise KBError("invalid_input", "reviewer y reason obligatorios", ["reviewer", "reason"])
+        raise KBError("invalid_input", "reviewer and reason are required", ["reviewer", "reason"])
     with tx() as (c, t):
         r = get_rule(c, rule_id)
         if r["status"] not in {"verified", "stale"}:
-            raise KBError("illegal_transition", f"{r['status']} -> active no permitida", ["status"])
+            raise KBError("illegal_transition", f"{r['status']} -> active is not allowed", ["status"])
         last_stale = c.execute("SELECT max(created_at) FROM rule_transitions "
                                "WHERE rule_id=? AND to_status='stale'", (rule_id,)).fetchone()[0]
         if not r["last_verified_at"] or (r["status"] == "stale" and
                                          r["last_verified_at"] <= (last_stale or "")):
-            raise KBError("verification_required", "Falta verificación efectiva en el contexto actual",
+            raise KBError("verification_required", "An effective verification is missing for the current context",
                           ["verify_resolution"])
         sev = severity or r["severity"]
         if sev not in SEVERITIES:
-            raise KBError("invalid_input", "severity inválida", ["severity"])
+            raise KBError("invalid_input", "invalid severity", ["severity"])
         paths = sorted(set(norm_path(p) for p in (dependency_paths or [])))
         fp = dependency_fingerprint(paths) if paths else None
         rev = r["revision"] + (1 if r["status"] == "stale" else 0)
@@ -642,9 +642,9 @@ def activate_rule(rule_id: str, reviewer: str, reason: str, dependency_paths: li
 @mcp.tool()
 @tool_guard
 def deprecate_rule(rule_id: str, reason: str, reviewer: str, evidence_ref: str = "") -> dict:
-    """Cualquier estado salvo deprecated -> deprecated. Motivo obligatorio; no borra historia."""
+    """Any status except deprecated becomes deprecated. A reason is required. History stays."""
     if not reason or not reviewer:
-        raise KBError("invalid_input", "reason y reviewer obligatorios", ["reason", "reviewer"])
+        raise KBError("invalid_input", "reason and reviewer are required", ["reason", "reviewer"])
     with tx() as (c, t):
         r = get_rule(c, rule_id)
         why = reason + (f" [ref:{evidence_ref}]" if evidence_ref else "")
@@ -666,7 +666,7 @@ def build_artifacts(c: sqlite3.Connection, project: str) -> tuple[str, str, int]
                       "content_hash": r["content_hash"], "incident_ids": inc[:5]})
     doc = {"schema_version": SCHEMA_VERSION, "project": project, "rules": rules}
     js = canonical_json(doc, indent=2) + "\n"
-    md = [f"# Reglas activas: {project}", ""]
+    md = [f"# Active rules: {project}", ""]
     for r in rules:
         md.append(f"- [{r['severity']}] `{r['id']}` ({r['scope']}): {r['invariant']} -> {r['action']}")
     md_s = "\n".join(md) + "\n"
@@ -686,7 +686,7 @@ def atomic_write(path: Path, text: str) -> None:
 @mcp.tool()
 @tool_guard
 def compile_artifacts(project: str, write: bool = True) -> dict:
-    """Compila invariants.json (canónico) y active_rules.md en ARTIFACT_DIR (ruta fija)."""
+    """Write canonical invariants.json and active_rules.md under ARTIFACT_DIR."""
     with tx() as (c, t):
         refresh_staleness(c, project, t)
         js, md, n = build_artifacts(c, project)
@@ -703,7 +703,7 @@ def compile_artifacts(project: str, write: bool = True) -> dict:
 @tool_guard
 def list_active_invariants(project: str, scope: str = "", severity: str = "",
                            limit: int = 50) -> dict:
-    """Inventario compacto de reglas activas; hash del artefacto canónico completo del proyecto."""
+    """Compact list of active rules, plus the hash of the full canonical artifact."""
     limit = max(1, min(limit, 200))
     with tx() as (c, t):
         refresh_staleness(c, project, t)
@@ -737,7 +737,7 @@ def _git(root: Path, args: list[str]) -> list[str] | None:
 
 
 def git_changes(root: Path = Path(".")) -> list[str] | None:
-    """Diff del cwd solo si ese cwd es la raíz del repo. None si no hay repo."""
+    """Names from git diff when cwd is the work-tree root. None when it is not a repo."""
     if _git(root, ["rev-parse", "--is-inside-work-tree"]) != ["true"]:
         return None
     top = _git(root, ["rev-parse", "--show-toplevel"])
@@ -776,7 +776,7 @@ def infer_change_types(paths: list[str]) -> list[str]:
 
 
 def enrich_summary(summary: dict[str, Any], root: Path = Path(".")) -> tuple[dict[str, Any], list[str]]:
-    """Une lo que mandó el agente con el diff. El agente puede agregar archivos; no puede ocultar los del diff."""
+    """Union of the agent's summary and the git diff. The agent may add files. It cannot hide files git already shows."""
     summary = dict(summary)
     found = git_changes(root) or []
     if not found:
@@ -807,8 +807,8 @@ def _walk(node: Any, acc: set[str], field: str, ops: set[str]) -> None:
 
 
 def variant_note(condition: dict[str, Any], s: dict[str, Any]) -> str | None:
-    """Cerca, pero no exacto: mismo directorio o el mismo primer token de error_code.
-    ponytail: primer token, no similitud de texto. Embeddings siguen fuera."""
+    """Near miss: same directory, or the same first token of error_code.
+    ponytail: first token only. No text similarity."""
     dirs: set[str] = set()
     raw_paths: set[str] = set()
     _walk(condition, raw_paths, "files_touched", {"touches_any", "touches_all", "any_in"})
@@ -825,7 +825,7 @@ def variant_note(condition: dict[str, Any], s: dict[str, Any]) -> str | None:
     for f in s.get("files_touched") or []:
         parent = str(PurePosixPath(f).parent)
         if parent not in ("", ".") and parent in dirs:
-            return "mismo directorio"
+            return "same directory"
     codes: set[str] = set()
     _walk(condition, codes, "error_code", {"eq", "prefix", "in"})
     got = s.get("error_code") or ""
@@ -836,14 +836,14 @@ def variant_note(condition: dict[str, Any], s: dict[str, Any]) -> str | None:
 
     g = stem(got)
     if g and any(stem(c) == g and c != got for c in codes):
-        return "error_code emparentado"
+        return "related error_code"
     return None
 
 
 @mcp.tool()
 @tool_guard
 def preflight_check(summary: dict[str, Any], limit: int = MAX_MATCHES) -> dict:
-    """Evalúa un ChangeSummaryV1. El diff git entra solo. Hipótesis y variantes avisan, no bloquean."""
+    """Evaluate a ChangeSummaryV1. Git names are merged in. Hypotheses and variants warn. They do not block."""
     summary, git_files = enrich_summary(summary)
     s, missing_fields = normalize_summary(summary)
     limit = max(1, min(limit, MAX_MATCHES))
@@ -874,7 +874,7 @@ def preflight_check(summary: dict[str, Any], limit: int = MAX_MATCHES) -> dict:
         if r["status"] == "stale":
             stale_hits.append({"rule_id": r["id"], "invariant": r["invariant"]})
         elif r["status"] in {"hypothesis", "verified"}:
-            note = "hipótesis, no bloquea" if r["status"] == "hypothesis" else "verificada, sin activar"
+            note = "hypothesis, does not block" if r["status"] == "hypothesis" else "verified, not activated"
             hypo_hits.append({"rule_id": r["id"], "invariant": r["invariant"], "note": note, "severity": "info"})
         else:
             matches.append({"rule_id": r["id"], "severity": r["severity"], "invariant": r["invariant"],
@@ -901,7 +901,7 @@ def preflight_check(summary: dict[str, Any], limit: int = MAX_MATCHES) -> dict:
     return {"ok": True, "status": status, "matches": matches[:limit],
             "hypothesis_matches": hypo_hits[:limit],
             "stale_matches": [{"rule_id": m["rule_id"], "invariant": m["invariant"],
-                               "note": "requiere revalidación"} for m in stale_hits[:limit]],
+                               "note": "needs revalidation"} for m in stale_hits[:limit]],
             "variant_matches": variants[:limit],
             "evaluated": len(rows), "missing_fields": missing_all,
             "artifact_sha256": sha256(js), "git_files": git_files,
@@ -911,7 +911,7 @@ def preflight_check(summary: dict[str, Any], limit: int = MAX_MATCHES) -> dict:
 @mcp.tool()
 @tool_guard
 def preflight_stats(project: str) -> dict:
-    """Cuántos preflights hubo y cuántos precedieron a un incidente. No mide lo que no pasó."""
+    """How many preflights ran, and how many were followed by an incident. It does not count checks that never happened."""
     project = bounded("project", project, 160)
     with tx() as (c, _):
         rows = c.execute("""SELECT status, outcome, COUNT(*) n FROM preflight_log
@@ -937,17 +937,17 @@ SECTIONS = {"summary": ("title", "symptom", "error_code", "status", "subsystem",
 @tool_guard
 def get_incident_details(incident_id: str, sections: list[str] | None = None,
                          max_chars: int = 2000) -> dict:
-    """Detalle acotado de un incidente por id exacto; siempre redactado."""
+    """Bounded detail for one incident, looked up by exact id. Text is redacted again."""
     sections = sorted(set(sections or ["summary", "cause", "resolution", "verification"]))
     bad = set(sections) - set(SECTIONS) - {"verification"}
     if bad:
-        raise KBError("invalid_input", f"sections inválidas: {sorted(bad)}", ["sections"])
+        raise KBError("invalid_input", f"invalid sections: {sorted(bad)}", ["sections"])
     max_chars = max(200, min(max_chars, 8000))
     c = _open()
     try:
         row = c.execute("SELECT * FROM incidents WHERE id=?", (incident_id,)).fetchone()
         if row is None:
-            raise KBError("not_found", "incident_id no encontrado", ["incident_id"])
+            raise KBError("not_found", "incident_id not found", ["incident_id"])
         logs = c.execute("""SELECT verdict,method,created_at,evidence_summary FROM verification_log
             WHERE incident_id=? ORDER BY created_at DESC LIMIT 5""", (incident_id,)).fetchall()
     finally:
