@@ -274,3 +274,7 @@ The draft keys are exactly `record_failure` arguments. `project` is the repo dir
 6. Errors never carry a traceback, a filesystem path, or SQL. `invalid_condition` and invalid-summary errors carry schema hints in `fields`, so the contract is discoverable from the error alone.
 7. Technical tokens (`0x` addresses, git hashes, `sha256:`/`md5:` digests) never raise the entropy warning. Real secrets still redact.
 8. A recurrence warning is a warning: `record_failure` still succeeds, and `get_incident_details` still returns the family in `related_incidents`.
+
+## Support
+
+[![Ko-fi](https://ziadoua.github.io/m3-Markdown-Badges/badges/Ko-fi/ko-fi1.svg)](https://ko-fi.com/brnomt)
