@@ -1,4 +1,8 @@
+import contextlib
+import io
 import json
+import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -120,6 +124,61 @@ class MergeTest(unittest.TestCase):
         with self.assertRaises(cli.ConfigError):
             cli.serve_project("/no/such/dfiu-project", is_tty=False)
         self.assertIsNone(cli.serve_project("", is_tty=True))
+
+
+class RecallTest(unittest.TestCase):
+    def make_repo(self, root: Path) -> Path:
+        repo = root / "proj"
+        repo.mkdir()
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        (repo / "a.txt").write_text("one\n", encoding="utf-8")
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "init", "-m", "baseline"], cwd=repo,
+                       check=True, capture_output=True, env=env)
+        (repo / "a.txt").write_text("two\n", encoding="utf-8")
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "fix crash when config is missing",
+                        "-m", "the loader assumed a header"], cwd=repo,
+                       check=True, capture_output=True, env=env)
+        return repo
+
+    def test_recall_prints_drafts_and_writes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self.make_repo(Path(tmp))
+            before = sorted(p.name for p in repo.iterdir())
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                self.assertEqual(cli.main(["recall", "--repo", str(repo)]), 0)
+            data = json.loads(buf.getvalue())
+            self.assertTrue(data["dry_run"])
+            self.assertEqual(data["count"], 1)
+            draft = data["drafts"][0]
+            self.assertEqual(set(draft), {"project", "title", "symptom", "suspected_cause",
+                                          "evidence_summary"})
+            self.assertEqual(draft["project"], "proj")
+            self.assertEqual(draft["title"], "fix crash when config is missing")
+            self.assertEqual(draft["symptom"], "fix crash when config is missing")
+            self.assertEqual(draft["suspected_cause"], "the loader assumed a header")
+            self.assertIn("git commit", draft["evidence_summary"])
+            self.assertIn(draft["title"], draft["evidence_summary"])
+            # Strictly dry-run: the repo is untouched and no kb was created.
+            self.assertEqual(sorted(p.name for p in repo.iterdir()), before)
+            self.assertFalse((repo / ".dfiu").exists())
+            self.assertFalse((Path(tmp) / ".dfiu").exists())
+
+    def test_recall_limit_and_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self.make_repo(Path(tmp))
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                self.assertEqual(cli.main(["recall", "--repo", str(repo), "--limit", "5"]), 0)
+            self.assertEqual(json.loads(buf.getvalue())["count"], 1)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(cli.main(["recall", "--repo", str(Path(tmp) / "nope")]), 1)
+            self.assertIn("dfiu:", err.getvalue())
 
 
 if __name__ == "__main__":

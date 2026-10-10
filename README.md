@@ -68,15 +68,15 @@ Nine tools. Success is `{"ok": true, ...}`. Failure is `{"ok": false, "error": {
 
 | Tool | What it does |
 | --- | --- |
-| `record_failure` | Opens an incident. If you also send a proposed invariant, you must send the action, the condition, and the scope; that creates a `hypothesis` rule linked to the incident. |
+| `record_failure` | Opens an incident. If you also send a proposed invariant, you must send the action, the condition, and the scope; that creates a `hypothesis` rule linked to the incident. The rule's `dependency_paths` default to the files named in `touches_any`/`touches_all` of the condition (an explicit `dependency_paths` list wins). A repeat of an earlier incident — same `project` and `condition_hash`, or a near-identical title — adds a `possible recurrence of incident <id>` warning; the call still succeeds. |
 | `verify_resolution` | Appends a verification. An effective pass resolves the incident and moves a linked hypothesis to `verified`. It never activates a rule. |
-| `activate_rule` | `verified` or `stale` → `active`. Requires `reviewer` and `reason`. From `stale`, there must be an effective verification newer than the stale transition, and `revision` increments. |
+| `activate_rule` | `verified` or `stale` → `active`. Requires `reviewer` and `reason`. From `stale`, there must be an effective verification newer than the stale transition, and `revision` increments. `dependency_paths` omitted inherits the paths stored on the rule; an explicit list wins. |
 | `deprecate_rule` | Any non-deprecated status → `deprecated`. Requires `reviewer` and `reason`. |
-| `preflight_check` | Evaluates a `ChangeSummaryV1` plus the git diff. Returns matches, hypotheses, stale rules, and near-miss variants. |
+| `preflight_check` | Evaluates a `ChangeSummaryV1` plus the git diff. Returns matches, hypotheses, stale rules, and near-miss variants. An invalid summary returns the expected keys in `error.fields`. |
 | `preflight_stats` | Counts preflights for a project, and how many were later followed by `record_failure` (`recurred`). |
 | `compile_artifacts` | Refreshes staleness, then writes canonical `invariants.json` and derived `active_rules.md`. |
 | `list_active_invariants` | Compact inventory of active rules. Optional `scope` and `severity` filters. |
-| `get_incident_details` | One incident, by exact id, in bounded sections. Text is redacted again on the way out. |
+| `get_incident_details` | One incident, by exact id, in bounded sections. Text is redacted again on the way out. The `related_incidents` section (on by default) lists the other incidents sharing the same `condition_hash`. |
 
 `record_failure` and `verify_resolution` accept `idempotency_key`. The same key and the same request replay the stored response. The same key with a different request returns `idempotency_conflict`.
 
@@ -107,6 +107,8 @@ Evaluated in this order:
 | `environment_tags` | no | Sorted, de-duplicated. |
 | `operation`, `subsystem`, `error_code`, `revision` | no | `revision` is a git sha, or the explicit string `"unknown"`. |
 | `empty_reason` | conditional | Required when a required list above is present but empty. |
+
+When the summary is invalid, the error keeps its code and the offending field, and `error.fields` also carries the expected keys (`schema_version`, `project`, `services`, `files_touched`, `change_type`, plus the optional ones), so a caller can self-correct without reading the source.
 
 When the process cwd is the git work-tree root, DFIU unions `files_touched` and `change_type` with `git diff`, the index, and untracked files. The agent can add paths. It cannot omit paths that git already shows. If cwd is not that root, git is ignored and the summary stands alone.
 
@@ -141,11 +143,15 @@ Scalars are `project`, `operation`, `subsystem`, `error_code`, `revision`. Lists
 
 A variant is a near miss: same directory family, or the same `error_code` family, without a full match. Variants are reported. They do not block.
 
+Every `invalid_condition` error carries `fields` with a one-line grammar example — `{"op":"all","args":[{"op":"eq","field":"subsystem","value":"x"},{"op":"touches_any","field":"files_touched","value":["path"]}]}` — plus the allowed operators, so the shape is discoverable from the error alone. The hint is static text; it is never built from user input.
+
 ### Staleness
 
 `preflight_check`, `list_active_invariants`, and `compile_artifacts` refresh staleness first. An active rule becomes `stale` when `valid_until` or `review_after` has passed, or when the `dependency_fingerprint` no longer matches.
 
 The fingerprint is declared at activation as a list of repo-relative files. It is the sha256 of each normalized path plus the sha256 of that file's bytes (`MISSING` if the file is gone), in sorted order. A rule with no dependency paths only expires by date.
+
+Dependencies usually declare themselves: `record_failure` seeds the rule's `dependency_paths` with the file paths named in `touches_any`/`touches_all` of the condition, and `activate_rule` with no `dependency_paths` inherits those instead of wiping them. An explicit `dependency_paths` list — at record time or at activation — always wins. A path that escapes the project is rejected as `invalid_input` with `dependency_paths` in `fields`.
 
 ### Artifacts
 
@@ -162,11 +168,13 @@ Free text is scrubbed before it is stored, and `get_incident_details` redacts ag
 
 High-entropy strings (Shannon entropy ≥ 4.0 bits/character, length ≥ 20) are not rewritten. The response carries a warning and does not echo the candidate. If anything was redacted, the incident's `sensitivity` is `redacted`. A `restricted` incident is supposed to return only `title`, `status`, and `error_code`.
 
+Legitimate technical tokens never raise that warning: `0x`-prefixed hex addresses (4–16 hex digits, like `0x0304F298`), standalone git hashes (7–40 hex chars), and strings prefixed `sha256:` or `md5:`. The allowlist only silences the low-confidence entropy warning; every secret pattern in the catalog above is still redacted, and a real high-entropy string still warns.
+
 ## Layout and storage
 
 ```
 server.py                          the server
-cli.py                             dfiu install / dfiu serve
+cli.py                             dfiu install / dfiu serve / dfiu recall
 test_mvp.py                        unittest suite
 test_install.py                    config merge tests
 requirements.txt                   mcp==1.30.0
@@ -222,13 +230,39 @@ A typical agent loop:
 5. `activate_rule` when a reviewer is willing to put their name on it.
 6. `compile_artifacts` so the JSON and Markdown match the database.
 
+## dfiu recall
+
+`dfiu recall --repo <path> [--limit N]` mines the repo's own history for failures you already paid for. It scans the last 2000 non-merge commits of `git log` for failure-indicating words — `fix`, `revert`, `brick`, `crash`, `wrong`, `broken`, and their family (`bug`, `regression`, `fail`, `fault`, `error`, `panic`, `deadlock`, `corrupt`, `hang`, `leak`, `wipe`, `oops`) — and prints DRAFT incident JSON to stdout for human review.
+
+It is strictly dry-run. Nothing is written: not to the knowledge base, not to the repo, not to a file. A draft is a starting point; a human edits it and then calls `record_failure`.
+
+```json
+{
+  "dry_run": true,
+  "note": "drafts for human review; nothing was written to the kb",
+  "repo": "/path/to/repo",
+  "count": 1,
+  "drafts": [
+    {
+      "project": "repo",
+      "title": "fix crash when config is missing",
+      "symptom": "fix crash when config is missing",
+      "suspected_cause": "the loader assumed a header",
+      "evidence_summary": "git commit 0304f298...: fix crash when config is missing"
+    }
+  ]
+}
+```
+
+The draft keys are exactly `record_failure` arguments. `project` is the repo directory name, `title` and `symptom` come from the commit subject, `suspected_cause` from the commit body, and `evidence_summary` carries the commit hash. `--limit` (default 10) caps how many drafts are printed.
+
 ## Tests
 
 ```bash
 .venv/bin/python -m unittest test_mvp test_install
 ```
 
-`test_mvp.py` walks the happy path: record, verify, activate, preflight, artifacts, idempotency, and the git-union behavior on ASCII paths. `test_install.py` checks that install and uninstall touch only the `dfiu` entry.
+`test_mvp.py` walks the happy path: record, verify, activate, preflight, artifacts, idempotency, and the git-union behavior on ASCII paths, plus the error hints, the entropy allowlist, dependency auto-suggestion, and recurrence families. `test_install.py` checks that install and uninstall touch only the `dfiu` entry, and that `dfiu recall` prints drafts while writing nothing.
 
 ## What the server guarantees
 
@@ -237,3 +271,6 @@ A typical agent loop:
 3. `hypothesis` and `verified` come back as `hypothesis_matches` at severity `info` and do not block.
 4. The same directory, or the same `error_code` family, comes back as `variant_matches`.
 5. Each preflight is logged. `record_failure` marks those rows `recurred`. `preflight_stats` returns the counts.
+6. Errors never carry a traceback, a filesystem path, or SQL. `invalid_condition` and invalid-summary errors carry schema hints in `fields`, so the contract is discoverable from the error alone.
+7. Technical tokens (`0x` addresses, git hashes, `sha256:`/`md5:` digests) never raise the entropy warning. Real secrets still redact.
+8. A recurrence warning is a warning: `record_failure` still succeeds, and `get_incident_details` still returns the family in `related_incidents`.

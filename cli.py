@@ -5,11 +5,25 @@ import argparse
 import importlib.metadata
 import json
 import os
+import re
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
 AGENTS = ("cursor", "claude", "codex", "kiro", "commandcode")
+
+# Words that make a commit look failure-related. Word match, case-insensitive.
+FAILURE_WORDS = (
+    "fix", "fixed", "fixes", "fixing", "hotfix", "bugfix", "revert", "reverted", "reverts",
+    "brick", "bricked", "bricking", "crash", "crashes", "crashed", "crashing",
+    "wrong", "broken", "bug", "bugs", "regression", "fail", "fails", "failed", "failure",
+    "fault", "error", "errors", "segfault", "panic", "deadlock", "corrupt", "corrupted",
+    "corruption", "hang", "hangs", "freeze", "leak", "leaks", "oops", "wipe", "wiped",
+    "data loss",
+)
+FAILURE_RE = re.compile(r"\b(?:" + "|".join(FAILURE_WORDS) + r")\b", re.IGNORECASE)
+RECALL_SCAN_COMMITS = 2000
 
 
 class ConfigError(Exception):
@@ -261,6 +275,57 @@ def serve(project: str) -> int:
     return 0
 
 
+def git_log_failures(root: Path, limit: int) -> list[dict]:
+    """Scan git log for failure-indicating commits. Reads the repo, writes nothing."""
+    env = os.environ.copy()
+    for var in ("GIT_DIR", "GIT_WORK_TREE"):
+        env.pop(var, None)
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(root), "log", f"-n{RECALL_SCAN_COMMITS}", "--no-merges",
+             "--format=%H%x1f%s%x1f%b%x1e"],
+            capture_output=True, text=True, timeout=30, env=env)
+    except (OSError, subprocess.TimeoutExpired):
+        raise ConfigError("git is not available")
+    if proc.returncode != 0:
+        raise ConfigError("not a git repository")
+    drafts: list[dict] = []
+    for chunk in proc.stdout.split("\x1e"):
+        parts = chunk.strip("\n").split("\x1f", 2)
+        if len(parts) != 3:
+            continue
+        commit_hash, subject, body = parts
+        if not FAILURE_RE.search(subject + "\n" + body):
+            continue
+        drafts.append({
+            "project": root.name,
+            "title": subject[:240],
+            "symptom": subject[:1000],
+            "suspected_cause": body.strip()[:1000],
+            "evidence_summary": f"git commit {commit_hash}: {subject}"[:1000],
+        })
+        if len(drafts) >= limit:
+            break
+    return drafts
+
+
+def recall(repo: str, limit: int) -> int:
+    """Print DRAFT incident JSON from failure-looking commits. Strictly dry-run."""
+    root = Path(repo).expanduser()
+    if not root.is_dir():
+        raise ConfigError(f"not a directory: {repo}")
+    drafts = git_log_failures(root.resolve(), max(1, limit))
+    out = {
+        "dry_run": True,
+        "note": "drafts for human review; nothing was written to the kb",
+        "repo": repo,
+        "count": len(drafts),
+        "drafts": drafts,
+    }
+    sys.stdout.write(json.dumps(out, indent=2, ensure_ascii=False) + "\n")
+    return 0
+
+
 def _ask(label: str, default: str) -> str:
     raw = input(f"{label} [{default}]: ").strip()
     return raw or default
@@ -322,6 +387,12 @@ def main(argv: list[str] | None = None) -> int:
     p_un.add_argument("-l", "--location", default="", choices=["", "global", "local"])
     p_un.add_argument("-y", "--yes", action="store_true", help="global + all, no prompt")
 
+    p_recall = sub.add_parser(
+        "recall",
+        help="scan git log for failure-looking commits and print DRAFT incident JSON; writes nothing")
+    p_recall.add_argument("--repo", required=True, help="git repository to scan")
+    p_recall.add_argument("--limit", type=int, default=10, help="max drafts to print (default 10)")
+
     sub.add_parser("version", help="print the version")
 
     args = parser.parse_args(argv)
@@ -342,6 +413,8 @@ def main(argv: list[str] | None = None) -> int:
                            Path.home(), Path.cwd(), command_path())
         if args.cmd == "uninstall":
             return uninstall(args.target, args.location, args.yes, Path.home(), Path.cwd())
+        if args.cmd == "recall":
+            return recall(args.repo, args.limit)
     except ConfigError as e:
         print(f"dfiu: {e}", file=sys.stderr)
         return 1

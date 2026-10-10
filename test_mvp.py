@@ -249,6 +249,96 @@ class MVP(unittest.TestCase):
         via_tool = self.record(condition=deep)
         self.assertEqual(via_tool["error"]["code"], "invalid_condition")
 
+    def test_error_hints_are_discoverable(self) -> None:
+        # invalid_condition carries a one-line grammar example in fields.
+        with self.assertRaises(server.KBError) as e:
+            server.validate_condition({"op": "nope"})
+        self.assertEqual(e.exception.code, "invalid_condition")
+        hint = " ".join(e.exception.fields)
+        self.assertIn('"op":"all"', hint)
+        self.assertIn("touches_any", hint)
+        via_tool = self.record(condition={"op": "eq", "field": "services", "value": "node"})
+        self.assertEqual(via_tool["error"]["code"], "invalid_condition")
+        self.assertTrue(any('"op":"all"' in f for f in via_tool["error"]["fields"]))
+        # An invalid ChangeSummaryV1 lists the expected keys in fields.
+        bad = server.preflight_check({"schema_version": 2, "project": PROJECT})
+        self.assertEqual(bad["error"]["code"], "unsupported_schema")
+        fields = " ".join(bad["error"]["fields"])
+        for key in ("schema_version", "project", "services", "files_touched", "change_type"):
+            self.assertIn(key, fields)
+        bad2 = server.preflight_check({"schema_version": 1, "project": PROJECT, "services": "node",
+                                       "files_touched": ["a.py"], "change_type": ["code"]})
+        self.assertEqual(bad2["error"]["code"], "invalid_input")
+        self.assertIn("empty_reason", " ".join(bad2["error"]["fields"]))
+
+    def test_dependency_autosuggestion(self) -> None:
+        cond = {"op": "all", "args": [
+            {"op": "touches_any", "field": "files_touched", "value": ["deploy/compose.yaml"]},
+            {"op": "touches_all", "field": "files_touched", "value": ["src/app.py", "deploy/*"]},
+        ]}
+        rec = self.record(proposed_invariant="auto deps", scope="auto", condition=cond)
+        self.assertTrue(rec["ok"], rec)
+        paths = json.loads(self.q("SELECT dependency_paths_json FROM rules WHERE id=?",
+                                  (rec["rule_id"],))[0][0])
+        self.assertEqual(paths, ["deploy/*", "deploy/compose.yaml", "src/app.py"])
+        # Explicit dependency_paths win over the suggestion.
+        rec2 = self.record(proposed_invariant="explicit deps", scope="explicit",
+                           condition={"op": "touches_any", "field": "files_touched",
+                                      "value": ["deploy/compose.yaml"]},
+                           dependency_paths=["dep/pin.txt"])
+        paths2 = json.loads(self.q("SELECT dependency_paths_json FROM rules WHERE id=?",
+                                   (rec2["rule_id"],))[0][0])
+        self.assertEqual(paths2, ["dep/pin.txt"])
+        # Activation without dependency_paths keeps them and declares the
+        # fingerprint, so the staleness mechanism works out of the box.
+        (self.root / "deploy").mkdir()
+        (self.root / "src").mkdir()
+        (self.root / "deploy" / "compose.yaml").write_bytes(b"v1")
+        (self.root / "src" / "app.py").write_bytes(b"v1")
+        self.verify(rec["incident_id"], rec["rule_id"])
+        act = self.activate(rec["rule_id"])
+        self.assertTrue(act["ok"], act)
+        self.assertEqual(json.loads(self.q("SELECT dependency_paths_json FROM rules WHERE id=?",
+                                           (rec["rule_id"],))[0][0]),
+                         ["deploy/*", "deploy/compose.yaml", "src/app.py"])
+        self.assertIsNotNone(self.q("SELECT dependency_fingerprint FROM rules WHERE id=?",
+                                    (rec["rule_id"],))[0][0])
+        pf = server.preflight_check(self.summary(files_touched=["deploy/compose.yaml", "src/app.py"]))
+        self.assertIn(rec["rule_id"], [m["rule_id"] for m in pf["matches"]])
+        (self.root / "src" / "app.py").write_bytes(b"v2")
+        pf = server.preflight_check(self.summary(files_touched=["deploy/compose.yaml", "src/app.py"]))
+        self.assertIn(rec["rule_id"], [m["rule_id"] for m in pf["stale_matches"]])
+
+    def test_recurrence_families(self) -> None:
+        def bare(**kw: object) -> dict:
+            return self.record(condition=None, proposed_invariant="", proposed_action="",
+                               scope="", **kw)
+        first = bare(title="Boot loop after flash", condition_hash="h-42")
+        self.assertTrue(first["ok"], first)
+        # Same (project, condition_hash): warn, but the call still succeeds.
+        second = bare(title="unrelated wording", condition_hash="h-42")
+        self.assertTrue(second["ok"], second)
+        self.assertIn(f"possible recurrence of incident {first['incident_id']}", second["warnings"])
+        # A near-identical title counts even without a shared hash.
+        third = bare(title="boot loop after flash!")
+        self.assertIn(f"possible recurrence of incident {first['incident_id']}", third["warnings"])
+        # An unrelated incident does not warn.
+        fourth = bare(title="Telemetry dashboard colors")
+        self.assertFalse([w for w in fourth["warnings"] if "recurrence" in w], fourth["warnings"])
+        # related_incidents lists the shared condition_hash family.
+        detail = server.get_incident_details(second["incident_id"])
+        self.assertEqual([r["id"] for r in detail["related_incidents"]],
+                         [first["incident_id"]])
+        for r in detail["related_incidents"]:
+            self.assertEqual(set(r), {"id", "title", "status", "created_at", "resolution"})
+            self.assertEqual(r["title"], "Boot loop after flash")
+        # The section can be requested alone.
+        only = server.get_incident_details(first["incident_id"], sections=["related_incidents"])
+        self.assertEqual([r["id"] for r in only["related_incidents"]], [second["incident_id"]])
+        self.assertNotIn("title", only)
+        # No shared hash: an empty family, not an error.
+        self.assertEqual(server.get_incident_details(third["incident_id"])["related_incidents"], [])
+
     def test_change_summary_contract(self) -> None:
         bad = server.preflight_check(self.summary(schema_version=2))
         self.assertEqual(bad["error"]["code"], "unsupported_schema")
@@ -466,6 +556,32 @@ class MVP(unittest.TestCase):
         self.assertNotIn(locked["incident_id"], json.dumps(missing))
         bad_sec = server.get_incident_details(locked["incident_id"], sections=["nope"])
         self.assertEqual(bad_sec["error"]["code"], "invalid_input")
+
+    def test_entropy_allowlist(self) -> None:
+        # 0x addresses, git hashes, and sha256:/md5: digests are technical
+        # tokens: no entropy warning, no echo problem.
+        digest = "0123456789abcdef" * 4  # 64 hex chars
+        git_hash = "0123456789abcdef" * 2  # 32 hex chars
+        tokens = [
+            "fault at 0x0304F298 then 0x0304F298deadbeef",
+            f"fixed in {git_hash} and again in 0304f298",
+            f"sha256:{digest}",
+            f"md5:{git_hash}",
+        ]
+        for text in tokens:
+            self.assertEqual(server.low_confidence_candidates(text), 0, text)
+            rec = self.record(symptom=text, condition=None, proposed_invariant="",
+                              proposed_action="", scope="")
+            self.assertTrue(rec["ok"], rec)
+            self.assertFalse(any("high-entropy" in w for w in rec["warnings"]),
+                             (text, rec["warnings"]))
+        # Real high-entropy strings still warn, and real secrets still redact.
+        self.assertGreaterEqual(server.low_confidence_candidates(ENTROPY), 1)
+        leaky = self.record(symptom=f"key ghp_{'a' * 36} and {ENTROPY}",
+                            proposed_invariant="still noisy", proposed_action="x", scope="noisy")
+        self.assertTrue(any("high-entropy" in w for w in leaky["warnings"]))
+        self.assertTrue(any("redacted github_token" in w for w in leaky["warnings"]))
+        self.assertNotIn("ghp_", json.dumps(leaky))
 
     def test_internal_error_is_opaque(self) -> None:
         orig = server.tx

@@ -1,6 +1,7 @@
 # server.py — DFIU v2 (MVP). Local stdio server. No network, no LLM.
 from __future__ import annotations
 
+import difflib
 import fnmatch
 import hashlib
 import json
@@ -96,6 +97,15 @@ SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 ]
 CANDIDATE = re.compile(r"[A-Za-z0-9+/=_\-]{%d,}" % ENTROPY_MIN_LEN)
 REDACTED = re.compile(r"\[REDACTED:secret:[a-z_]+\]")
+# Legitimate technical tokens that never trigger the entropy warning:
+# 0x-prefixed hex addresses (4-16 hex digits), standalone git hashes (7-40 hex
+# chars), and sha256:/md5: prefixed digests. Real secret patterns above still
+# redact; this only silences the low-confidence entropy warning.
+TECH_TOKEN_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"(?i)(?:sha256|md5):[0-9a-fA-F]+"),
+    re.compile(r"0x[0-9a-fA-F]{4,16}"),
+    re.compile(r"(?<![0-9A-Za-z])[0-9a-fA-F]{7,40}(?![0-9A-Za-z])"),
+]
 
 
 def shannon(s: str) -> float:
@@ -132,8 +142,11 @@ def redact(text: str) -> tuple[str, list[str]]:
 
 
 def low_confidence_candidates(text: str) -> int:
-    """Count high-entropy strings that were not redacted. The strings themselves are not returned."""
+    """Count high-entropy strings that were not redacted. The strings themselves are not returned.
+    Allowlisted technical tokens (0x addresses, git hashes, sha256:/md5: digests) are skipped."""
     clean = REDACTED.sub("", text)
+    for pat in TECH_TOKEN_PATTERNS:
+        clean = pat.sub(" ", clean)
     return sum(1 for m in CANDIDATE.finditer(clean) if shannon(m.group(0)) >= ENTROPY_THRESHOLD)
 
 
@@ -326,35 +339,52 @@ SCALAR_FIELDS = {"project", "operation", "subsystem", "error_code", "revision"}
 LEAF_OPS = {"eq", "in", "prefix", "exists", "touches_any", "touches_all", "any_in"}
 BOOL_OPS = {"all", "any", "not"}
 
+# One-line, redaction-safe hints embedded in error fields so callers can self-correct
+# without reading the source.
+CONDITION_GRAMMAR_HINT = (
+    'example: {"op":"all","args":[{"op":"eq","field":"subsystem","value":"x"},'
+    '{"op":"touches_any","field":"files_touched","value":["path"]}]}'
+    " | bool ops: all/any/not ({op,args}); leaf ops: eq/in/exists/prefix/touches_any/"
+    "touches_all/any_in ({op,field,value})"
+)
+CHANGE_SUMMARY_HINT = (
+    "expected keys: schema_version=1, project, services, files_touched, change_type"
+    " | optional: environment_tags, operation, subsystem, error_code, revision, empty_reason"
+)
+
+
+def _invalid_condition(message: str) -> KBError:
+    return KBError("invalid_condition", message, [CONDITION_GRAMMAR_HINT])
+
 
 def validate_condition(node: Any, depth: int = 1, count: list[int] | None = None) -> None:
     count = count if count is not None else [0]
     count[0] += 1
     if depth > MAX_DEPTH or count[0] > MAX_NODES:
-        raise KBError("invalid_condition", f"Condition exceeds depth {MAX_DEPTH} or {MAX_NODES} nodes")
+        raise _invalid_condition(f"Condition exceeds depth {MAX_DEPTH} or {MAX_NODES} nodes")
     if not isinstance(node, dict) or "op" not in node:
-        raise KBError("invalid_condition", "Node is missing 'op'")
+        raise _invalid_condition("Node is missing 'op'")
     op = node["op"]
     if op in BOOL_OPS:
         args = node.get("args")
         if not isinstance(args, list) or not args or (op == "not" and len(args) != 1):
-            raise KBError("invalid_condition", f"'{op}' needs valid args")
+            raise _invalid_condition(f"'{op}' needs valid args")
         if set(node) != {"op", "args"}:
-            raise KBError("invalid_condition", "Unexpected keys on a boolean node")
+            raise _invalid_condition("Unexpected keys on a boolean node")
         for a in args:
             validate_condition(a, depth + 1, count)
         return
     if op not in LEAF_OPS:
-        raise KBError("invalid_condition", f"Operator not allowed: {op}")
+        raise _invalid_condition(f"Operator not allowed: {op}")
     field = node.get("field")
     if field not in LIST_FIELDS | SCALAR_FIELDS:
-        raise KBError("invalid_condition", f"Field not allowed: {field}")
+        raise _invalid_condition(f"Field not allowed: {field}")
     if op == "exists":
         if set(node) != {"op", "field"}:
-            raise KBError("invalid_condition", "exists only accepts field")
+            raise _invalid_condition("exists only accepts field")
         return
     if set(node) != {"op", "field", "value"}:
-        raise KBError("invalid_condition", "A leaf node requires op, field, and value")
+        raise _invalid_condition("A leaf node requires op, field, and value")
     v = node["value"]
     if op in {"eq", "prefix"}:
         ok = field in SCALAR_FIELDS and isinstance(v, str)
@@ -366,7 +396,7 @@ def validate_condition(node: Any, depth: int = 1, count: list[int] | None = None
         if ok and op in {"touches_any", "touches_all"}:
             ok = field == "files_touched" and all(set(x) & set("[]") == set() for x in v)
     if not ok:
-        raise KBError("invalid_condition", f"Invalid types for {op}/{field}")
+        raise _invalid_condition(f"Invalid types for {op}/{field}")
 
 
 class Missing(Exception):
@@ -473,6 +503,34 @@ def refresh_staleness(c: sqlite3.Connection, project: str, t: str) -> None:
             transition(c, r, "stale", reason, "system", t, ", stale_reason=?", (reason,))
 
 
+# ---------- recurrence ----------
+def title_key(title: str) -> str:
+    """Normalized title for near-identical comparison: casefolded words."""
+    return " ".join(re.split(r"[^0-9a-z]+", title.casefold())).strip()
+
+
+def near_identical_title(a: str, b: str) -> bool:
+    ka, kb = title_key(a), title_key(b)
+    if not ka or not kb:
+        return False
+    return ka == kb or difflib.SequenceMatcher(None, ka, kb).ratio() >= 0.9
+
+
+def find_recurrence(c: sqlite3.Connection, project: str, condition_hash: str,
+                    title: str) -> str | None:
+    """Id of the most recent earlier incident that looks like the same failure, or None."""
+    if condition_hash:
+        row = c.execute("""SELECT id FROM incidents WHERE project=? AND condition_hash=?
+                           ORDER BY created_at DESC LIMIT 1""", (project, condition_hash)).fetchone()
+        if row:
+            return row["id"]
+    for row in c.execute("""SELECT id,title FROM incidents WHERE project=?
+                            ORDER BY created_at DESC LIMIT 200""", (project,)):
+        if near_identical_title(title, row["title"]):
+            return row["id"]
+    return None
+
+
 # ---------- tools ----------
 @mcp.tool()
 @tool_guard
@@ -482,8 +540,11 @@ def record_failure(project: str, title: str, symptom: str, subsystem: str = "",
                    proposed_resolution: str = "", evidence_summary: str = "",
                    proposed_invariant: str = "", proposed_action: str = "",
                    condition: dict[str, Any] | None = None, scope: str = "",
-                   severity: str = "warning", idempotency_key: str = "") -> dict:
-    """Open an incident. Optionally attach a hypothesis rule."""
+                   severity: str = "warning",
+                   dependency_paths: list[str] | None = None,
+                   idempotency_key: str = "") -> dict:
+    """Open an incident. Optionally attach a hypothesis rule.
+    dependency_paths default to the files in touches_any/touches_all of the condition."""
     request = {k: v for k, v in locals().items() if k != "idempotency_key"}
     warnings: list[str] = []
     with tx() as (c, t):
@@ -493,6 +554,11 @@ def record_failure(project: str, title: str, symptom: str, subsystem: str = "",
         tags_s = sorted(set(tags or []))
         incident_id = str(uuid.uuid4())
         title_s = scrub("title", title, 240, warnings)
+        # A repeat of the same (project, condition_hash), or a near-identical
+        # title, warns but never blocks: the call still succeeds.
+        prior = find_recurrence(c, bounded("project", project, 160), condition_hash or "", title_s)
+        if prior:
+            warnings.append(f"possible recurrence of incident {prior}")
         c.execute("""INSERT INTO incidents(id,created_at,updated_at,project,subsystem,environment,
             title,symptom,error_code,condition_hash,root_cause,resolution,status,
             evidence_summary,tags_json,sensitivity) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
@@ -515,12 +581,25 @@ def record_failure(project: str, title: str, symptom: str, subsystem: str = "",
             validate_condition(condition)
             inv = scrub("proposed_invariant", proposed_invariant, 200, warnings)
             act = scrub("proposed_action", proposed_action, 200, warnings)
+            # Dependency auto-suggestion: touches_any/touches_all on files_touched
+            # seed the rule's dependency_paths, unless the caller sent them explicitly.
+            touched: set[str] = set()
+            _walk(condition, touched, "files_touched", {"touches_any", "touches_all"})
+            dep = dependency_paths if dependency_paths is not None else sorted(touched)
+            try:
+                dep_paths = sorted(set(norm_path(p) for p in dep))
+            except KBError as e:
+                raise KBError("invalid_input", e.message, ["dependency_paths"])
             rule_id = "R-" + uuid.uuid4().hex[:12]
             c.execute("""INSERT INTO rules(id,created_at,updated_at,project,scope,title,invariant,
-                condition_json,action,status,severity,content_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                condition_json,action,status,severity,content_hash,dependency_paths_json)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (rule_id, t, t, project, scope, title_s, inv, canonical_json(condition), act,
-                 "hypothesis", severity, rule_hash(project, scope, condition, inv, act, severity)))
+                 "hypothesis", severity, rule_hash(project, scope, condition, inv, act, severity),
+                 canonical_json(dep_paths)))
             c.execute("INSERT INTO incident_rules VALUES(?,?,?)", (incident_id, rule_id, t))
+        elif dependency_paths:
+            warnings.append("dependency_paths ignored: no proposed rule was created")
         c.execute("UPDATE preflight_log SET outcome='recurred' WHERE project=? AND outcome='open'",
                   (bounded("project", project, 160),))
         response = {"ok": True, "incident_id": incident_id, "status": "open", "rule_id": rule_id,
@@ -624,6 +703,10 @@ def activate_rule(rule_id: str, reviewer: str, reason: str, dependency_paths: li
         sev = severity or r["severity"]
         if sev not in SEVERITIES:
             raise KBError("invalid_input", "invalid severity", ["severity"])
+        # dependency_paths=None inherits the paths stored on the rule (for example
+        # auto-suggested at record time) instead of wiping them. An explicit list wins.
+        if dependency_paths is None:
+            dependency_paths = json.loads(r["dependency_paths_json"])
         paths = sorted(set(norm_path(p) for p in (dependency_paths or [])))
         fp = dependency_fingerprint(paths) if paths else None
         rev = r["revision"] + (1 if r["status"] == "stale" else 0)
@@ -845,7 +928,12 @@ def variant_note(condition: dict[str, Any], s: dict[str, Any]) -> str | None:
 def preflight_check(summary: dict[str, Any], limit: int = MAX_MATCHES) -> dict:
     """Evaluate a ChangeSummaryV1. Git names are merged in. Hypotheses and variants warn. They do not block."""
     summary, git_files = enrich_summary(summary)
-    s, missing_fields = normalize_summary(summary)
+    try:
+        s, missing_fields = normalize_summary(summary)
+    except KBError as e:
+        if CHANGE_SUMMARY_HINT not in e.fields:
+            e.fields.append(CHANGE_SUMMARY_HINT)
+        raise
     limit = max(1, min(limit, MAX_MATCHES))
     with tx() as (c, t):
         refresh_staleness(c, s["project"], t)
@@ -933,13 +1021,27 @@ SECTIONS = {"summary": ("title", "symptom", "error_code", "status", "subsystem",
             "references": ("evidence_summary", "evidence_ref")}
 
 
+def _related_row(x: sqlite3.Row, max_chars: int) -> dict[str, Any]:
+    """One recurrence-family row: id, title, status, created_at, short resolution."""
+    hidden = x["sensitivity"] == "restricted"
+    short = min(max_chars, 200)
+    return {"id": x["id"],
+            "title": "[RESTRICTED]" if hidden else redact(x["title"])[0][:short],
+            "status": x["status"],
+            "created_at": x["created_at"],
+            "resolution": None if x["resolution"] is None else
+                          ("[RESTRICTED]" if hidden else redact(x["resolution"])[0][:short])}
+
+
 @mcp.tool()
 @tool_guard
 def get_incident_details(incident_id: str, sections: list[str] | None = None,
                          max_chars: int = 2000) -> dict:
-    """Bounded detail for one incident, looked up by exact id. Text is redacted again."""
-    sections = sorted(set(sections or ["summary", "cause", "resolution", "verification"]))
-    bad = set(sections) - set(SECTIONS) - {"verification"}
+    """Bounded detail for one incident, looked up by exact id. Text is redacted again.
+    related_incidents lists other incidents sharing the same condition_hash."""
+    sections = sorted(set(sections or ["summary", "cause", "resolution", "verification",
+                                       "related_incidents"]))
+    bad = set(sections) - set(SECTIONS) - {"verification", "related_incidents"}
     if bad:
         raise KBError("invalid_input", f"invalid sections: {sorted(bad)}", ["sections"])
     max_chars = max(200, min(max_chars, 8000))
@@ -950,11 +1052,19 @@ def get_incident_details(incident_id: str, sections: list[str] | None = None,
             raise KBError("not_found", "incident_id not found", ["incident_id"])
         logs = c.execute("""SELECT verdict,method,created_at,evidence_summary FROM verification_log
             WHERE incident_id=? ORDER BY created_at DESC LIMIT 5""", (incident_id,)).fetchall()
+        related: list[sqlite3.Row] = []
+        if row["condition_hash"]:
+            related = c.execute("""SELECT id,title,status,created_at,resolution,sensitivity
+                FROM incidents WHERE condition_hash=? AND id<>?
+                ORDER BY created_at DESC LIMIT 5""", (row["condition_hash"], incident_id)).fetchall()
     finally:
         c.close()
     restricted = row["sensitivity"] == "restricted"
     out: dict[str, Any] = {"ok": True, "incident_id": incident_id, "sensitivity": row["sensitivity"]}
     for sec in sections:
+        if sec == "related_incidents":
+            out["related_incidents"] = [_related_row(x, max_chars) for x in related]
+            continue
         if sec == "verification":
             out["verifications"] = [{**dict(x), "evidence_summary":
                                      redact(x["evidence_summary"])[0][:max_chars]} for x in logs]
