@@ -166,7 +166,9 @@ High-entropy strings (Shannon entropy ≥ 4.0 bits/character, length ≥ 20) are
 
 ```
 server.py                          the server
+cli.py                             dfiu install / dfiu serve
 test_mvp.py                        unittest suite
+test_install.py                    config merge tests
 mcp_failure_preflight_spec_v2.md   the contract
 requirements.txt                   mcp==1.30.0
 requirements.lock                  same pin, for the reason below
@@ -181,27 +183,25 @@ SQLite lives at `$FAILURE_KB_DIR/kb.sqlite3` (default `.failure-kb/kb.sqlite3`).
 
 **Git policy B** (this repo): `.failure-kb/` is gitignored, database included. Artifacts are regenerated with `compile_artifacts`. The database is never committed. Policy A (version the two artifact files and fail CI on drift) is described in the spec and is not what this tree does.
 
-## Run it
+## Install
 
 Python 3.11 or newer. The `mcp` package is pinned to 1.30.0 because mcp 2.x renamed FastMCP; `requirements.lock` is that pin.
+
+```bash
+uv tool install --editable /absolute/path/to/dfiu
+dfiu install -y
+```
+
+`dfiu install` writes only the `dfiu` entry and leaves every other MCP server alone. `-y` picks global configs and the agents that already have a config directory: Cursor (`~/.cursor/mcp.json`), Claude Code (`~/.claude.json`), and Codex (`~/.codex/config.toml`). `-l local` writes `.cursor/mcp.json`, `.mcp.json`, and `.codex/config.toml` in the current directory. `--target cursor,claude` limits the set. `--print-config cursor` prints a snippet and writes nothing. `--refresh` updates entries that are already there. `dfiu uninstall -y` removes only the `dfiu` key. A changed file is copied to `*.dfiu.bak` first. Invalid JSON is left untouched.
+
+The registered command is the absolute path of the `dfiu` you just ran, with args `serve`. Cursor also gets `--project ${workspaceFolder}`, because that client does not always start the process in the workspace. Claude Code and Codex start in the project, so they get `serve` alone. Restart the client after installing.
+
+`dfiu serve` is what the client launches. In a terminal it prints that and exits. `python server.py` is the same server without the install command, for development:
 
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 .venv/bin/python server.py
-```
-
-`server.py` migrates, then serves stdio. If you run it in a terminal you will see nothing useful: the client owns stdin. Point the MCP client at the venv interpreter and set the working directory to the project whose diff should be read. Example for Cursor (`.cursor/mcp.json`), with paths adjusted:
-
-```json
-{
-  "mcpServers": {
-    "dfiu": {
-      "command": "/absolute/path/to/dfiu/.venv/bin/python",
-      "args": ["/absolute/path/to/dfiu/server.py"]
-    }
-  }
-}
 ```
 
 A typical agent loop:
@@ -216,10 +216,10 @@ A typical agent loop:
 ## Tests
 
 ```bash
-.venv/bin/python -m unittest test_mvp
+.venv/bin/python -m unittest test_mvp test_install
 ```
 
-`test_mvp.py` walks the happy path: record, verify, activate, preflight, artifacts, idempotency, and the git-union behavior on ASCII paths. It does not cover the gaps below.
+`test_mvp.py` walks the happy path: record, verify, activate, preflight, artifacts, idempotency, and the git-union behavior on ASCII paths. It does not cover the gaps below. `test_install.py` checks that install and uninstall touch only the `dfiu` entry.
 
 ## Contract vs. this tree
 

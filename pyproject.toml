@@ -9,5 +9,8 @@ description = "DFIU (Don't F*ck It Up): servidor MCP local de fallos e invariant
 requires-python = ">=3.11"
 dependencies = ["mcp==1.30.0"]
 
+[project.scripts]
+dfiu = "cli:main"
+
 [tool.setuptools]
-py-modules = ["server"]
+py-modules = ["server", "cli"]
