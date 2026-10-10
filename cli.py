@@ -9,7 +9,7 @@ import shutil
 import sys
 from pathlib import Path
 
-AGENTS = ("cursor", "claude", "codex")
+AGENTS = ("cursor", "claude", "codex", "kiro", "commandcode")
 
 
 class ConfigError(Exception):
@@ -40,6 +40,16 @@ def entry_args(agent: str) -> list[str]:
 
 def json_entry(command: str, args: list[str]) -> dict:
     return {"type": "stdio", "command": command, "args": args}
+
+
+def agent_entry(agent: str, command: str, location: str) -> dict:
+    args = entry_args(agent)
+    if agent == "kiro":
+        return {"command": command, "args": args, "disabled": False}
+    # Command Code's project file is also .mcp.json. Same object, either writer.
+    if agent == "commandcode" or (agent == "claude" and location == "local"):
+        return {"type": "stdio", "transport": "stdio", "command": command, "args": args}
+    return json_entry(command, args)
 
 
 def load_json_config(text: str) -> dict:
@@ -130,11 +140,15 @@ def config_path(agent: str, location: str, home: Path, root: Path) -> Path:
             "cursor": home / ".cursor" / "mcp.json",
             "claude": home / ".claude.json",
             "codex": home / ".codex" / "config.toml",
+            "kiro": home / ".kiro" / "settings" / "mcp.json",
+            "commandcode": home / ".commandcode" / "mcp.json",
         }[agent]
     return {
         "cursor": root / ".cursor" / "mcp.json",
         "claude": root / ".mcp.json",
         "codex": root / ".codex" / "config.toml",
+        "kiro": root / ".kiro" / "settings" / "mcp.json",
+        "commandcode": root / ".mcp.json",
     }[agent]
 
 
@@ -146,6 +160,10 @@ def detected(home: Path) -> list[str]:
         found.append("claude")
     if (home / ".codex").is_dir():
         found.append("codex")
+    if (home / ".kiro").is_dir():
+        found.append("kiro")
+    if (home / ".commandcode").is_dir():
+        found.append("commandcode")
     return found
 
 
@@ -159,15 +177,13 @@ def select_agents(spec: str, home: Path) -> list[str]:
     bad = [n for n in names if n not in AGENTS]
     if bad or not names:
         raise ConfigError(f"unknown target: {', '.join(bad) or spec}")
-    # ponytail: insertion-ordered unique, three agents
     return list(dict.fromkeys(names))
 
 
 def snippet(agent: str, command: str) -> str:
-    args = entry_args(agent)
     if agent == "codex":
-        return toml_block(command, args)
-    return dump_json({"mcpServers": {"dfiu": json_entry(command, args)}})
+        return toml_block(command, entry_args(agent))
+    return dump_json({"mcpServers": {"dfiu": agent_entry(agent, command, "global")}})
 
 
 def write_if_changed(path: Path, text: str) -> str:
@@ -186,7 +202,7 @@ def write_if_changed(path: Path, text: str) -> str:
     return "updated"
 
 
-def apply_install(path: Path, agent: str, command: str, refresh: bool) -> str:
+def apply_install(path: Path, agent: str, command: str, refresh: bool, location: str = "global") -> str:
     text = path.read_text(encoding="utf-8") if path.exists() else ""
     if agent == "codex":
         if refresh and not toml_has_dfiu(text):
@@ -195,7 +211,7 @@ def apply_install(path: Path, agent: str, command: str, refresh: bool) -> str:
     else:
         if refresh and not json_has_dfiu(text):
             return "skipped"
-        new = upsert_mcp_json(text, json_entry(command, entry_args(agent)))
+        new = upsert_mcp_json(text, agent_entry(agent, command, location))
     return write_if_changed(path, new)
 
 
@@ -254,7 +270,7 @@ def _choose(target: str, location: str, yes: bool, default_target: str) -> tuple
     if yes or not sys.stdin.isatty():
         return target or default_target, location or "global"
     if not target:
-        target = _ask("target (auto, all, cursor, claude, codex)", default_target)
+        target = _ask("target (auto, all, cursor, claude, codex, kiro, commandcode)", default_target)
     if not location:
         location = _ask("location (global, local)", "global")
     if location not in {"global", "local"}:
@@ -271,7 +287,7 @@ def install(target: str, location: str, yes: bool, refresh: bool, home: Path, ro
         return 1
     for agent in agents:
         path = config_path(agent, location, home, root)
-        status = apply_install(path, agent, command, refresh)
+        status = apply_install(path, agent, command, refresh, location)
         print(f"{agent:8} {location:6} {status:10} {path}")
     print("Restart the client so it reloads MCP servers.")
     return 0
@@ -294,8 +310,8 @@ def main(argv: list[str] | None = None) -> int:
     p_serve = sub.add_parser("serve", help="MCP server over stdio")
     p_serve.add_argument("--project", default="", help="workspace directory")
 
-    p_inst = sub.add_parser("install", help="register dfiu with Cursor, Claude Code, and Codex")
-    p_inst.add_argument("-t", "--target", default="", help="auto, all, or cursor,claude,codex")
+    p_inst = sub.add_parser("install", help="register dfiu with Cursor, Claude Code, Codex, Kiro, and Command Code")
+    p_inst.add_argument("-t", "--target", default="", help="auto, all, or cursor,claude,codex,kiro,commandcode")
     p_inst.add_argument("-l", "--location", default="", choices=["", "global", "local"])
     p_inst.add_argument("-y", "--yes", action="store_true", help="global + auto, no prompt")
     p_inst.add_argument("--refresh", action="store_true", help="update existing dfiu entries only")

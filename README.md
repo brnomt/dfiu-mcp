@@ -192,9 +192,19 @@ uv tool install --editable /absolute/path/to/dfiu
 dfiu install -y
 ```
 
-`dfiu install` writes only the `dfiu` entry and leaves every other MCP server alone. `-y` picks global configs and the agents that already have a config directory: Cursor (`~/.cursor/mcp.json`), Claude Code (`~/.claude.json`), and Codex (`~/.codex/config.toml`). `-l local` writes `.cursor/mcp.json`, `.mcp.json`, and `.codex/config.toml` in the current directory. `--target cursor,claude` limits the set. `--print-config cursor` prints a snippet and writes nothing. `--refresh` updates entries that are already there. `dfiu uninstall -y` removes only the `dfiu` key. A changed file is copied to `*.dfiu.bak` first. Invalid JSON is left untouched.
+`dfiu install` writes only the `dfiu` entry and leaves every other MCP server alone. `-y` picks global configs and the agents that already have a config directory:
 
-The registered command is the absolute path of the `dfiu` you just ran, with args `serve`. Cursor also gets `--project ${workspaceFolder}`, because that client does not always start the process in the workspace. Claude Code and Codex start in the project, so they get `serve` alone. Restart the client after installing.
+| Agent | Global | In this project (`-l local`) |
+| --- | --- | --- |
+| Cursor | `~/.cursor/mcp.json` | `.cursor/mcp.json` |
+| Claude Code | `~/.claude.json` | `.mcp.json` |
+| Codex | `~/.codex/config.toml` | `.codex/config.toml` |
+| Kiro | `~/.kiro/settings/mcp.json` | `.kiro/settings/mcp.json` |
+| Command Code | `~/.commandcode/mcp.json` | `.mcp.json` (project scope) |
+
+`--target kiro,commandcode` limits the set. `--print-config kiro` prints a snippet and writes nothing. `--refresh` updates entries that are already there. `dfiu uninstall -y` removes only the `dfiu` key. A changed file is copied to `*.dfiu.bak` first. Invalid JSON is left untouched.
+
+The registered command is the absolute path of the `dfiu` you just ran, with args `serve`. Cursor also gets `--project ${workspaceFolder}`, because that client does not always start the process in the workspace. The others start in the project, so they get `serve` alone. Claude Code and Command Code share `.mcp.json` in a project; the entry carries both `type` and `transport` so either client can read it. Restart the client after installing. Kiro reloads `mcp.json` when the file is saved.
 
 `dfiu serve` is what the client launches. In a terminal it prints that and exits. `python server.py` is the same server without the install command, for development:
 

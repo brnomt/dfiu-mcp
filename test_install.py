@@ -65,6 +65,23 @@ class MergeTest(unittest.TestCase):
         self.assertEqual(cli.entry_args("cursor")[-1], "${workspaceFolder}")
         self.assertEqual(cli.entry_args("claude"), ["serve"])
         self.assertEqual(cli.entry_args("codex"), ["serve"])
+        self.assertEqual(cli.entry_args("kiro"), ["serve"])
+        self.assertEqual(cli.entry_args("commandcode"), ["serve"])
+
+    def test_kiro_and_commandcode(self) -> None:
+        home, root = Path("/home/u"), Path("/work")
+        self.assertEqual(cli.config_path("kiro", "global", home, root), home / ".kiro/settings/mcp.json")
+        self.assertEqual(cli.config_path("kiro", "local", home, root), root / ".kiro/settings/mcp.json")
+        self.assertEqual(cli.config_path("commandcode", "global", home, root), home / ".commandcode/mcp.json")
+        self.assertEqual(cli.config_path("commandcode", "local", home, root), root / ".mcp.json")
+        kiro = cli.agent_entry("kiro", "dfiu", "global")
+        self.assertEqual(kiro["args"], ["serve"])
+        self.assertFalse(kiro["disabled"])
+        self.assertNotIn("type", kiro)
+        shared = cli.agent_entry("commandcode", "dfiu", "local")
+        self.assertEqual(shared, cli.agent_entry("claude", "dfiu", "local"))
+        self.assertEqual(shared["transport"], "stdio")
+        self.assertEqual(cli.agent_entry("commandcode", "dfiu", "global")["transport"], "stdio")
 
     def test_refresh_skips_missing_entry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
