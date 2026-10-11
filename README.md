@@ -17,6 +17,12 @@ A preflight should answer one question: *have we already broken this exact kind 
 
 Out of scope, on purpose: automatic diagnosis, autonomous repair, conversation ingestion, embeddings, and any tool that flashes hardware, runs Docker, or talks to an external database.
 
+## Facts only
+
+DFIU stores what happened, not what the agent expects. Do not call `record_failure` or `verify_resolution` from a theory, a plan, or a belief that the last edit worked.
+
+The user says whether it works or it does not. That sentence is the fact. Write it first. Then make the fix, or continue the flow. A preflight reads rules. It does not invent an incident. `dfiu recall` prints drafts. It does not write them.
+
 ## How a failure becomes a check
 
 ```
@@ -225,8 +231,8 @@ A typical agent loop:
 
 1. `preflight_check` with a `ChangeSummaryV1` before a deploy, a schema change, or a firmware flash.
 2. On `alert`, call `get_incident_details` for the ids in the match. Do not treat `hypothesis_matches` as a block.
-3. After a failure in the wild, `record_failure`. If you already know the invariant, include `proposed_invariant`, `proposed_action`, `condition`, and `scope`.
-4. `verify_resolution` once a real test exercises the old failure.
+3. When the user says it failed, `record_failure` with that fact before changing code. If the invariant is already known, include `proposed_invariant`, `proposed_action`, `condition`, and `scope`.
+4. When the user says the check passed, `verify_resolution`. Do not send a pass because the patch looks right.
 5. `activate_rule` when a reviewer is willing to put their name on it.
 6. `compile_artifacts` so the JSON and Markdown match the database.
 

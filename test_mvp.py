@@ -708,7 +708,8 @@ class MVP(unittest.TestCase):
         )
         async with stdio_client(params) as (read, write):
             async with ClientSession(read, write) as session:
-                await session.initialize()
+                init = await session.initialize()
+                self.assertIn("user has confirmed", init.instructions or "")
                 listed = await session.list_tools()
                 names = sorted(t.name for t in listed.tools)
                 self.assertEqual(names, [

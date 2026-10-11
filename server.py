@@ -31,7 +31,14 @@ ENTROPY_MIN_LEN = 20
 CHANGE_TYPES = {"code", "config", "dependency", "schema", "infra", "firmware", "docs", "test"}
 SEVERITIES = {"info", "warning", "blocker"}
 
-mcp = FastMCP("dfiu")
+# Shown to the agent on connect. A guess is not a fact.
+INSTRUCTIONS = (
+    "Write only what the user has confirmed. Never record a theory, a plan, or an assumption "
+    "that a change worked or failed. Wait until the user says it works or it does not. "
+    "Then call record_failure or verify_resolution with that fact, and only after that write "
+    "make the fix or continue. preflight_check reads rules. It does not create incidents."
+)
+mcp = FastMCP("dfiu", instructions=INSTRUCTIONS)
 
 
 # ---------- structured errors ----------
@@ -543,8 +550,8 @@ def record_failure(project: str, title: str, symptom: str, subsystem: str = "",
                    severity: str = "warning",
                    dependency_paths: list[str] | None = None,
                    idempotency_key: str = "") -> dict:
-    """Open an incident. Optionally attach a hypothesis rule.
-    dependency_paths default to the files in touches_any/touches_all of the condition."""
+    """Open an incident from a fact the user confirmed. Never from a guess that something failed.
+    Optionally attach a hypothesis rule. dependency_paths default to the files in touches_any/touches_all."""
     request = {k: v for k, v in locals().items() if k != "idempotency_key"}
     warnings: list[str] = []
     with tx() as (c, t):
@@ -616,7 +623,7 @@ def verify_resolution(incident_id: str, verdict: str, method: str, success_crite
                       evidence_summary: str, rule_id: str = "", environment: str = "",
                       source_revision: str = "", condition_hash: str = "", reviewer: str = "",
                       idempotency_key: str = "") -> dict:
-    """Append evidence. An effective pass needs a criterion, all preconditions passing, and the failing path exercised."""
+    """Append evidence the user confirmed by actually trying it. An effective pass needs a criterion, all preconditions passing, and the failing path exercised. Do not call this because you assume the fix worked."""
     request = {k: v for k, v in locals().items() if k != "idempotency_key"}
     if verdict not in {"pass", "fail", "inconclusive"}:
         raise KBError("invalid_input", "invalid verdict", ["verdict"])
