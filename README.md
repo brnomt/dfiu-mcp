@@ -229,7 +229,7 @@ python3 -m venv .venv
 
 A typical agent loop:
 
-1. `preflight_check` with a `ChangeSummaryV1` before a deploy, a schema change, or a firmware flash.
+1. `preflight_check` with a `ChangeSummaryV1` before any risky change: a deploy, a schema or data migration, a dependency bump, or a release.
 2. On `alert`, call `get_incident_details` for the ids in the match. Do not treat `hypothesis_matches` as a block.
 3. When the user says it failed, `record_failure` with that fact before changing code. If the invariant is already known, include `proposed_invariant`, `proposed_action`, `condition`, and `scope`.
 4. When the user says the check passed, `verify_resolution`. Do not send a pass because the patch looks right.

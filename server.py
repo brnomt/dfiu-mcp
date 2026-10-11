@@ -12,7 +12,7 @@ import sqlite3
 import subprocess
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterator
 
@@ -26,17 +26,39 @@ CHANGE_SUMMARY_VERSION = 1
 MAX_DEPTH = 4
 MAX_NODES = 32
 MAX_MATCHES = 5
+# A change is "preceded by a preflight" only if one ran for this project within
+# this window. Used both to warn when a confirmation arrives with no recent
+# preflight, and to scope which preflight rows a later failure marks 'recurred'.
+PREFLIGHT_WINDOW_SECONDS = 1800  # 30 minutes
 ENTROPY_THRESHOLD = 4.0      # bits/char, candidates at least 20 characters
 ENTROPY_MIN_LEN = 20
 CHANGE_TYPES = {"code", "config", "dependency", "schema", "infra", "firmware", "docs", "test"}
 SEVERITIES = {"info", "warning", "blocker"}
 
-# Shown to the agent on connect. A guess is not a fact.
+# Shown to the agent on connect. A guess is not a fact. This is the only guidance
+# that travels over MCP, so it must be self-contained and project-agnostic: no
+# project name, path, or domain assumption belongs here.
 INSTRUCTIONS = (
-    "Write only what the user has confirmed. Never record a theory, a plan, or an assumption "
-    "that a change worked or failed. Wait until the user says it works or it does not. "
-    "Then call record_failure or verify_resolution with that fact, and only after that write "
-    "make the fix or continue. preflight_check reads rules. It does not create incidents."
+    "DFIU is a project-agnostic memory of what already failed, so you do not re-try a dead idea. "
+    "It never runs your tools, touches your files, or deploys anything; you drive it by calling "
+    "its tools at the right moments.\n"
+    "GOLDEN RULE: write only what the user has confirmed by actually trying it. Never record a "
+    "theory, a plan, or an assumption that a change worked or failed. Wait until the user says it "
+    "works or it does not, then record that fact.\n"
+    "LOOK BEFORE YOU TOUCH: before any non-trivial change (editing a file with history, a "
+    "migration, a dependency bump, a release, a deploy, or any step that is costly to undo), call "
+    "preflight_check first with a ChangeSummaryV1 describing the change. If a required field is "
+    "missing, the error names the expected keys. preflight_check only reads rules; it never "
+    "creates an incident. Treat an alert as 'this approach already failed' and change course.\n"
+    "CANONICAL CYCLE: preflight_check (plan) -> record_failure (user confirmed it broke) -> "
+    "verify_resolution (user confirmed a fix by exercising the failing path) -> activate_rule "
+    "(promote a verified rule) -> compile_artifacts (write the shareable invariants). Each "
+    "response carries the next step in a 'next_step' or 'next_tool' field; follow it. "
+    "A hypothesis or an operator_review is never a pass.\n"
+    "HOOKS: if your client supports hooks, wire a pre-edit or pre-change hook to call preflight_check "
+    "and a confirmation hook to call record_failure/verify_resolution. Keep those hooks generic: key "
+    "them off the KB's own history (the files and rules it already tracks), never off a hardcoded "
+    "project name, tool, or path, so the same setup works on any project."
 )
 mcp = FastMCP("dfiu", instructions=INSTRUCTIONS)
 
@@ -72,6 +94,20 @@ def tool_guard(fn):
 # ---------- utilities ----------
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
+def window_start(t: str, seconds: int) -> str:
+    """The ISO timestamp `seconds` before t. Used to bound the preflight window.
+    Lexicographic string comparison on these fixed-offset ISO stamps is a valid
+    time order, so callers compare created_at >= window_start(now, N)."""
+    return (datetime.fromisoformat(t) - timedelta(seconds=seconds)).isoformat(timespec="microseconds")
+
+
+def had_recent_preflight(c: sqlite3.Connection, project: str, t: str) -> bool:
+    row = c.execute(
+        "SELECT 1 FROM preflight_log WHERE project=? AND created_at>=? LIMIT 1",
+        (project, window_start(t, PREFLIGHT_WINDOW_SECONDS))).fetchone()
+    return row is not None
 
 
 def canonical_json(obj: Any, indent: int | None = None) -> str:
@@ -239,6 +275,20 @@ MIGRATIONS: list[str] = [
       rule_ids_json TEXT NOT NULL,
       outcome TEXT NOT NULL DEFAULT 'open' CHECK(outcome IN ('open','recurred')));
     CREATE INDEX idx_preflight_project ON preflight_log(project, created_at DESC);
+    """,
+    # v3: drop write-only schema. These columns, this table, and this index were
+    # written but never read for any decision, and nothing surfaced them. Dropping
+    # them removes dead state, not behavior. SQLite >= 3.35 supports DROP COLUMN;
+    # the server requires a newer SQLite than that. (rules.confidence stays: it is
+    # decremented on a failed re-verification and asserted by the suite.)
+    """
+    DROP TABLE IF EXISTS artifact_state;
+    DROP INDEX IF EXISTS idx_vlog_rule;
+    ALTER TABLE rules DROP COLUMN verification_count;
+    ALTER TABLE rules DROP COLUMN source_revision;
+    ALTER TABLE verification_log DROP COLUMN source_revision;
+    ALTER TABLE verification_log DROP COLUMN condition_hash;
+    ALTER TABLE verification_log DROP COLUMN metadata_json;
     """,
 ]
 
@@ -459,9 +509,20 @@ def rule_hash(project: str, scope: str, condition: dict, invariant: str, action:
                                   "severity": severity}))
 
 
-def dependency_fingerprint(paths: list[str], root: Path = Path(".")) -> str:
+def project_root() -> Path:
+    """Stable repo root for reading dependency files: the parent of the KB dir
+    (default .dfiu), resolved absolutely. Anchoring here instead of the process
+    cwd keeps a rule from going falsely 'stale' when the server is launched with
+    a different cwd than the project. Derived live from KB_DIR so tests that
+    reassign KB_DIR still line up with the files they create under the root."""
+    return KB_DIR.resolve().parent
+
+
+def dependency_fingerprint(paths: list[str], root: Path | None = None) -> str:
     """sha256 of 'path\\0sha256(bytes)\\n' for each declared path, sorted.
-    A missing path contributes 'path\\0MISSING'. Directories are not allowed."""
+    A missing path contributes 'path\\0MISSING'. Directories are not allowed.
+    Paths are read relative to the project root, not the process cwd."""
+    root = project_root() if root is None else root
     lines = []
     for p in sorted(set(norm_path(x) for x in paths)):
         f = root / p
@@ -607,8 +668,18 @@ def record_failure(project: str, title: str, symptom: str, subsystem: str = "",
             c.execute("INSERT INTO incident_rules VALUES(?,?,?)", (incident_id, rule_id, t))
         elif dependency_paths:
             warnings.append("dependency_paths ignored: no proposed rule was created")
-        c.execute("UPDATE preflight_log SET outcome='recurred' WHERE project=? AND outcome='open'",
-                  (bounded("project", project, 160),))
+        # Anti-retry nudge: a confirmed failure that no preflight preceded means
+        # the KB could not have warned the agent off this change. Informational
+        # only -- an MCP server must not block the caller.
+        if not had_recent_preflight(c, bounded("project", project, 160), t):
+            warnings.append(f"no preflight_check preceded this change for project {project}")
+        # Mark 'recurred' only on preflights inside the window before this
+        # failure. A preflight from weeks ago is not a recurrence of today's
+        # failure. ponytail: time window only, not file/summary matching -- the
+        # window kills the bulk of the noise; per-file linkage can come later.
+        c.execute("UPDATE preflight_log SET outcome='recurred' WHERE project=? AND outcome='open' "
+                  "AND created_at>=?",
+                  (bounded("project", project, 160), window_start(t, PREFLIGHT_WINDOW_SECONDS)))
         response = {"ok": True, "incident_id": incident_id, "status": "open", "rule_id": rule_id,
                     "rule_status": "hypothesis" if rule_id else None, "warnings": warnings,
                     "next_step": "verify_resolution"}
@@ -621,8 +692,7 @@ def record_failure(project: str, title: str, symptom: str, subsystem: str = "",
 def verify_resolution(incident_id: str, verdict: str, method: str, success_criterion: str,
                       preconditions: dict[str, str], exercised_failing_path: bool,
                       evidence_summary: str, rule_id: str = "", environment: str = "",
-                      source_revision: str = "", condition_hash: str = "", reviewer: str = "",
-                      idempotency_key: str = "") -> dict:
+                      reviewer: str = "", idempotency_key: str = "") -> dict:
     """Append evidence the user confirmed by actually trying it. An effective pass needs a criterion, all preconditions passing, and the failing path exercised. Do not call this because you assume the fix worked."""
     request = {k: v for k, v in locals().items() if k != "idempotency_key"}
     if verdict not in {"pass", "fail", "inconclusive"}:
@@ -657,12 +727,11 @@ def verify_resolution(incident_id: str, verdict: str, method: str, success_crite
             pending.append("success_criterion")
         effective = verdict == "pass" and not pending
         c.execute("""INSERT INTO verification_log(id,incident_id,rule_id,created_at,verdict,method,
-            success_criterion,preconditions_json,exercised_failing_path,environment,source_revision,
-            condition_hash,evidence_summary,reviewer) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            success_criterion,preconditions_json,exercised_failing_path,environment,
+            evidence_summary,reviewer) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
             (str(uuid.uuid4()), incident_id, rule_id or None, t, verdict, method,
              scrub("success_criterion", success_criterion, 500, warnings),
              canonical_json(preconditions), int(exercised_failing_path), environment or None,
-             source_revision or None, condition_hash or None,
              scrub("evidence_summary", evidence_summary, 2000, warnings), reviewer or None))
         new_inc = inc["status"]
         if effective:
@@ -673,14 +742,19 @@ def verify_resolution(incident_id: str, verdict: str, method: str, success_crite
             c.execute("UPDATE incidents SET status=?, updated_at=? WHERE id=?", (new_inc, t, incident_id))
         rule_status = rule["status"] if rule else None
         if rule is not None and effective:
-            c.execute("""UPDATE rules SET verification_count=verification_count+1, last_verified_at=?,
-                updated_at=? WHERE id=?""", (t, t, rule_id))
+            c.execute("UPDATE rules SET last_verified_at=?, updated_at=? WHERE id=?",
+                      (t, t, rule_id))
             if rule["status"] == "hypothesis":
                 transition(c, rule, "verified", "verify_resolution pass", reviewer, t)
                 rule_status = "verified"
         elif rule is not None and verdict == "fail":
             c.execute("UPDATE rules SET confidence=max(0, confidence-0.2), updated_at=? WHERE id=?",
                       (t, rule_id))
+        # Same anti-retry nudge as record_failure: a confirmation with no recent
+        # preflight means the KB had no chance to warn. Informational, never blocks.
+        inc_project = c.execute("SELECT project FROM incidents WHERE id=?", (incident_id,)).fetchone()
+        if inc_project and not had_recent_preflight(c, inc_project["project"], t):
+            warnings.append(f"no preflight_check preceded this change for project {inc_project['project']}")
         response = {"ok": True, "incident_id": incident_id, "verdict": verdict,
                     "effective_pass": effective, "incident_status": new_inc,
                     "rule_status": rule_status, "pending_requirements": pending,
@@ -692,7 +766,7 @@ def verify_resolution(incident_id: str, verdict: str, method: str, success_crite
 @mcp.tool()
 @tool_guard
 def activate_rule(rule_id: str, reviewer: str, reason: str, dependency_paths: list[str] | None = None,
-                  source_revision: str = "", review_after: str = "", valid_until: str = "",
+                  review_after: str = "", valid_until: str = "",
                   severity: str = "") -> dict:
     """Move verified or stale to active. Needs a reviewer and an effective verification after the last change."""
     if not reviewer or not reason:
@@ -721,9 +795,9 @@ def activate_rule(rule_id: str, reviewer: str, reason: str, dependency_paths: li
                       r["action"], sev)
         transition(c, r, "active", reason, reviewer, t,
                    ", severity=?, revision=?, content_hash=?, dependency_paths_json=?, "
-                   "dependency_fingerprint=?, source_revision=?, review_after=?, valid_until=?, "
+                   "dependency_fingerprint=?, review_after=?, valid_until=?, "
                    "stale_reason=NULL",
-                   (sev, rev, h, canonical_json(paths), fp, source_revision or None,
+                   (sev, rev, h, canonical_json(paths), fp,
                     review_after or None, valid_until or None))
         return {"ok": True, "rule_id": rule_id, "status": "active", "revision": rev,
                 "content_hash": h, "dependency_fingerprint": fp}
@@ -784,7 +858,6 @@ def compile_artifacts(project: str, write: bool = True) -> dict:
         if write:
             atomic_write(ARTIFACT_DIR / "invariants.json", js)
             atomic_write(ARTIFACT_DIR / "active_rules.md", md)
-            c.execute("INSERT OR REPLACE INTO artifact_state VALUES('invariants.json',?,?,?)", (h, n, t))
         return {"ok": True, "project": project, "rule_count": n, "artifact_sha256": h,
                 "written": write, "files": ["invariants.json", "active_rules.md"] if write else []}
 

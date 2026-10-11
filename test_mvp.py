@@ -129,7 +129,7 @@ class MVP(unittest.TestCase):
     def test_migrations_and_permissions(self) -> None:
         server.migrate()
         with server.tx() as (c, _):
-            self.assertEqual(c.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual(c.execute("PRAGMA user_version").fetchone()[0], 3)
             self.assertEqual(c.execute("PRAGMA foreign_keys").fetchone()[0], 1)
         self.assertEqual(server.KB_DIR.stat().st_mode & 0o777, 0o700)
         self.assertEqual(server.DB.stat().st_mode & 0o777, 0o600)
@@ -686,13 +686,73 @@ class MVP(unittest.TestCase):
                          "related error_code")
         self.assertNotIn(near["rule_id"], [m["rule_id"] for m in pf["matches"]])
 
+    def test_anti_retry_warning_on_confirmation(self) -> None:
+        # A confirmed failure with no recent preflight warns; one preceded by a
+        # recent preflight does not. The warning never blocks the call.
+        msg = f"no preflight_check preceded this change for project {PROJECT}"
+        cold = self.record()
+        self.assertTrue(cold["ok"])
+        self.assertIn(msg, cold["warnings"])
+        # verify_resolution carries the same nudge.
+        v_cold = self.verify(cold["incident_id"], cold["rule_id"])
+        self.assertIn(msg, v_cold["warnings"])
+        # Run a preflight, then record/verify at the same instant: no warning.
+        server.preflight_check(self.summary())
+        warm = self.record(scope="warm", proposed_invariant="warm rule")
+        self.assertNotIn(msg, warm["warnings"])
+        v_warm = self.verify(warm["incident_id"], warm["rule_id"])
+        self.assertNotIn(msg, v_warm["warnings"])
+        # A preflight older than the window stops counting as "preceding".
+        self.clock.advance(server.PREFLIGHT_WINDOW_SECONDS + 1)
+        stale = self.record(scope="stale2", proposed_invariant="stale rule")
+        self.assertIn(msg, stale["warnings"])
+
+    def test_recurred_only_within_window(self) -> None:
+        # A preflight inside the window is marked recurred by a later failure; a
+        # preflight older than the window is not, so preflight_stats stays honest.
+        server.preflight_check(self.summary())          # t0, outside the window
+        self.clock.advance(server.PREFLIGHT_WINDOW_SECONDS + 60)
+        server.preflight_check(self.summary())          # t1, the recent one
+        self.record()                                   # failure at t1
+        outcomes = sorted(o for (o,) in self.q(
+            "SELECT outcome FROM preflight_log WHERE project=?", (PROJECT,)))
+        self.assertEqual(outcomes, ["open", "recurred"])
+        stats = server.preflight_stats(PROJECT)
+        self.assertEqual(sum(stats["recurred_after"].values()), 1)
+
+    def test_fingerprint_anchored_to_project_root_not_cwd(self) -> None:
+        # The dependency file lives under the project root (KB_DIR.parent). Even
+        # when the process cwd moves elsewhere, staleness reads the file from the
+        # root, so a rule does not go falsely stale on a different cwd.
+        pin = self.root / "dep" / "pin.txt"
+        pin.parent.mkdir()
+        pin.write_bytes(b"v1")
+        rec = self.record(proposed_invariant="anchored", scope="anchor",
+                          condition={"op": "eq", "field": "project", "value": PROJECT})
+        self.verify(rec["incident_id"], rec["rule_id"])
+        self.activate(rec["rule_id"], dependency_paths=["dep/pin.txt"])
+        self.assertEqual(server.project_root(), self.root.resolve())
+        elsewhere = tempfile.TemporaryDirectory()
+        try:
+            os.chdir(elsewhere.name)      # cwd no longer sees dep/pin.txt
+            pf = server.preflight_check(self.summary())
+            self.assertIn(rec["rule_id"], [m["rule_id"] for m in pf["matches"]])
+            self.assertNotIn(rec["rule_id"], [m["rule_id"] for m in pf["stale_matches"]])
+            # A real change to the file under the root is still detected.
+            pin.write_bytes(b"v2")
+            pf = server.preflight_check(self.summary())
+            self.assertIn(rec["rule_id"], [m["rule_id"] for m in pf["stale_matches"]])
+        finally:
+            os.chdir(self.root)
+            elsewhere.cleanup()
+
     def test_stdio_startup(self) -> None:
         kb = self.root / "stdio-kb"
         art = self.root / "stdio-art"
         asyncio.run(asyncio.wait_for(self._stdio(kb, art), 20))
         con = sqlite3.connect(kb / "kb.sqlite3")
         try:
-            self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], 3)
         finally:
             con.close()
 
