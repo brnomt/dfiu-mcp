@@ -354,3 +354,5 @@ The draft keys are exactly `record_failure` arguments. `project` is the repo dir
 ## 💛 Support
 
 [![Ko-fi](https://ziadoua.github.io/m3-Markdown-Badges/badges/Ko-fi/ko-fi1.svg)](https://ko-fi.com/brnomt)
+
+[![M8ven Score](https://m8ven.ai/badge/mcp/brnomt-dfiu-mcp-18knua?v=3a98171e3dc16070010f19ce460baad4)](https://m8ven.ai/mcp/brnomt-dfiu-mcp-18knua?s=readme)
