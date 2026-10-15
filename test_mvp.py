@@ -129,7 +129,7 @@ class MVP(unittest.TestCase):
     def test_migrations_and_permissions(self) -> None:
         server.migrate()
         with server.tx() as (c, _):
-            self.assertEqual(c.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(c.execute("PRAGMA user_version").fetchone()[0], 4)
             self.assertEqual(c.execute("PRAGMA foreign_keys").fetchone()[0], 1)
         self.assertEqual(server.KB_DIR.stat().st_mode & 0o777, 0o700)
         self.assertEqual(server.DB.stat().st_mode & 0o777, 0o600)
@@ -519,9 +519,14 @@ class MVP(unittest.TestCase):
             again, found2 = server.redact(text)
             self.assertEqual(again, text)
             self.assertEqual(found2, [])
+            # The secret also travels through a condition value, which is stored in
+            # rules.condition_json and compiled into invariants.json.
             rec = self.record(title=f"t {kind}", symptom=f"before {secret} after",
-                              proposed_invariant=f"inv {kind}", proposed_action="x", scope=kind)
+                              proposed_invariant=f"inv {kind}", proposed_action="x", scope=kind,
+                              condition={"op": "eq", "field": "error_code", "value": secret})
             self.assertTrue(rec["ok"], rec)
+            self.assertNotIn(secret, self.q("SELECT condition_json FROM rules WHERE id=?",
+                                            (rec["rule_id"],))[0][0])
             self.assertTrue(any(f"redacted {kind}" in w for w in rec["warnings"]))
             blob = " ".join(rec["warnings"])
             self.assertNotIn(secret, blob)
@@ -746,13 +751,198 @@ class MVP(unittest.TestCase):
             os.chdir(self.root)
             elsewhere.cleanup()
 
+    def test_condition_values_are_scrubbed_and_bounded(self) -> None:
+        # A condition is stored, compiled into invariants.json, and read back, so it
+        # gets the same scrub as every other stored field, and its strings are bounded.
+        secret = SECRETS["openai_like_key"]
+        rec = self.record(scope="cond-secret",
+                          condition={"op": "eq", "field": "error_code", "value": secret})
+        self.assertTrue(rec["ok"], rec)
+        self.assertTrue(any("redacted openai_like_key" in w for w in rec["warnings"]),
+                        rec["warnings"])
+        stored = self.q("SELECT condition_json FROM rules WHERE id=?", (rec["rule_id"],))[0][0]
+        self.assertNotIn(secret, stored)
+        self.assertIn("[REDACTED:secret:openai_like_key]", stored)
+        self.verify(rec["incident_id"], rec["rule_id"])
+        self.activate(rec["rule_id"])
+        self.assertTrue(server.compile_artifacts(PROJECT)["written"])
+        for path in (*server.KB_DIR.iterdir(), *server.ARTIFACT_DIR.iterdir()):
+            self.assertNotIn(secret.encode(), path.read_bytes(), path)
+        # The grammar bounds depth and node count; a single string is bounded too.
+        before = self.q("SELECT COUNT(*) FROM incidents")[0][0]
+        huge = self.record(scope="cond-huge", condition={"op": "eq", "field": "error_code",
+                                                          "value": "x" * (server.MAX_CONDITION_VALUE + 1)})
+        self.assertEqual(huge["error"]["code"], "too_large")
+        self.assertEqual(huge["error"]["fields"], ["condition"])
+        # A long string inside a list leaf is rejected the same way.
+        listed = self.record(scope="cond-list",
+                             condition={"op": "in", "field": "error_code",
+                                        "value": ["ok", "y" * (server.MAX_CONDITION_VALUE + 1)]})
+        self.assertEqual(listed["error"]["code"], "too_large")
+        # A rejected condition leaves nothing behind, not even the incident.
+        self.assertEqual(self.q("SELECT COUNT(*) FROM incidents")[0][0], before)
+        self.assertEqual([r[0] for r in self.q(
+            "SELECT scope FROM rules WHERE scope IN ('cond-huge','cond-list')")], [])
+
+    def test_confirmed_resolution_replaces_the_proposal(self) -> None:
+        rec = self.record(suspected_cause="creo que el disco",
+                          proposed_resolution="reiniciar el worker")
+        # At record time nothing is confirmed; the guess waits in the proposal columns.
+        self.assertIsNone(self.q("SELECT resolution FROM incidents WHERE id=?",
+                                 (rec["incident_id"],))[0][0])
+        detail = server.get_incident_details(rec["incident_id"], sections=["resolution", "proposal"])
+        self.assertFalse(detail["resolution_confirmed"])
+        self.assertNotIn("resolution", detail)
+        self.assertEqual(detail["proposed_resolution"], "reiniciar el worker")
+        self.assertEqual(detail["proposed_root_cause"], "creo que el disco")
+        first = self.verify(rec["incident_id"], rec["rule_id"])
+        self.assertFalse(first["resolution_confirmed"])
+        self.assertIn("resolution not recorded: send `resolution` with the confirmed fix",
+                      first["warnings"])
+        second = self.verify(rec["incident_id"], rec["rule_id"], resolution="purgar /var/log y rotar",
+                             root_cause="retención de logs sin rotación")
+        self.assertTrue(second["resolution_confirmed"], second)
+        detail = server.get_incident_details(rec["incident_id"], sections=["resolution", "proposal", "cause"])
+        self.assertTrue(detail["resolution_confirmed"])
+        self.assertEqual(detail["resolution"], "purgar /var/log y rotar")
+        self.assertEqual(detail["root_cause"], "retención de logs sin rotación")
+        self.assertEqual(detail["proposed_resolution"], "reiniciar el worker")
+
+    def test_activation_refuses_when_a_dependency_moved(self) -> None:
+        pin = self.root / "pin.txt"
+        pin.write_bytes(b"v1")
+        rec = self.record(proposed_invariant="el pin no cambia", scope="pin",
+                          condition={"op": "touches_any", "field": "files_touched",
+                                     "value": ["pin.txt"]})
+        self.assertEqual(json.loads(self.q("SELECT dependency_paths_json FROM rules WHERE id=?",
+                                           (rec["rule_id"],))[0][0]), ["pin.txt"])
+        self.verify(rec["incident_id"], rec["rule_id"])
+        pin.write_bytes(b"v2")            # the dependency moves after the verification
+        blocked = self.activate(rec["rule_id"])
+        self.assertEqual(blocked["error"]["code"], "verification_required")
+        self.assertIn("verify_resolution", blocked["error"]["fields"])
+        self.assertEqual(self.q("SELECT status FROM rules WHERE id=?",
+                                (rec["rule_id"],))[0][0], "verified")
+        # A fresh effective verification re-anchors the fingerprint.
+        self.verify(rec["incident_id"], rec["rule_id"])
+        self.assertTrue(self.activate(rec["rule_id"])["ok"])
+        # Once active, the ordinary staleness path still catches the next change.
+        pin.write_bytes(b"v3")
+        pf = server.preflight_check(self.summary(files_touched=["pin.txt"]))
+        self.assertEqual([m["rule_id"] for m in pf["stale_matches"]], [rec["rule_id"]])
+        self.assertEqual(self.q("SELECT stale_reason FROM rules WHERE id=?",
+                                (rec["rule_id"],))[0][0], "dependencies changed")
+
+    def test_browse_incidents(self) -> None:
+        a = self.record(title="worker crash on boot", scope="boot", subsystem="worker",
+                        error_code="ERR_BOOT_1", condition_hash="hash-a",
+                        condition={"op": "eq", "field": "subsystem", "value": "worker"})
+        b = self.record(title="dashboard colors", scope="ui", subsystem="ui",
+                        error_code="ERR_UI_2", tags=["ui", "cosmetic"])
+        self.clock.advance()
+        c = self.record(title="worker crash after flash 100%", scope="flash", subsystem="worker",
+                        error_code="ERR_BOOT_9", tags=["flash"])
+        # Exact id, and one row points at the full write-up.
+        one = server.list_incidents(incident_id=a["incident_id"])
+        self.assertEqual([r["id"] for r in one["incidents"]], [a["incident_id"]])
+        self.assertEqual(one["next_tool"], "get_incident_details")
+        self.assertEqual(one["count"], 1)
+        self.assertFalse(one["truncated"])
+        # Keywords: every term must appear in some searched field.
+        self.assertEqual(sorted(r["id"] for r in server.list_incidents(query="worker")["incidents"]),
+                         sorted([a["incident_id"], c["incident_id"]]))
+        both = server.list_incidents(query="worker flash")
+        self.assertEqual([r["id"] for r in both["incidents"]], [c["incident_id"]])
+        self.assertEqual(both["next_tool"], "get_incident_details")
+        # More than one row is a browse, not a pointer to one write-up.
+        self.assertIsNone(server.list_incidents(query="worker")["next_tool"])
+        # LIKE metacharacters are literal, not wildcards: only the row with a real % matches.
+        self.assertEqual([r["id"] for r in server.list_incidents(query="%")["incidents"]],
+                         [c["incident_id"]])
+        # Key fields.
+        self.assertEqual(sorted(r["id"] for r in server.list_incidents(subsystem="worker")["incidents"]),
+                         sorted([a["incident_id"], c["incident_id"]]))
+        self.assertEqual(sorted(r["id"] for r in server.list_incidents(status="open")["incidents"]),
+                         sorted([a["incident_id"], b["incident_id"], c["incident_id"]]))
+        self.assertEqual(sorted(r["id"] for r in server.list_incidents(error_code="ERR_BOOT")["incidents"]),
+                         sorted([a["incident_id"], c["incident_id"]]))
+        self.assertEqual([r["id"] for r in server.list_incidents(condition_hash="hash-a")["incidents"]],
+                         [a["incident_id"]])
+        self.assertEqual([r["id"] for r in server.list_incidents(tag="cosmetic")["incidents"]],
+                         [b["incident_id"]])
+        self.assertEqual(server.list_incidents(project="otro")["count"], 0)
+        # since, limit, and the default browse order.
+        newest = self.q("SELECT created_at FROM incidents WHERE id=?", (c["incident_id"],))[0][0]
+        self.assertEqual(server.list_incidents(since=newest)["count"], 1)
+        page = server.list_incidents(limit=1)
+        self.assertEqual(page["count"], 1)
+        self.assertTrue(page["truncated"])
+        self.assertEqual(page["incidents"][0]["id"], c["incident_id"])
+        self.assertEqual(server.list_incidents()["count"], 3)
+        # An unknown status is a discoverable contract error, not silence.
+        bad = server.list_incidents(status="nope")
+        self.assertEqual(bad["error"]["code"], "invalid_input")
+        self.assertEqual(bad["error"]["fields"], ["status"])
+        # A restricted incident keeps identity but not its body, confirmed fix included.
+        locked = self.record(title="customer data", scope="locked", subsystem="billing",
+                             error_code="ERR_LOCK")
+        self.verify(locked["incident_id"], locked["rule_id"], resolution="call the vendor")
+        self.q("UPDATE incidents SET sensitivity='restricted' WHERE id=?", (locked["incident_id"],))
+        row = server.list_incidents(incident_id=locked["incident_id"])["incidents"][0]
+        self.assertEqual(row["title"], "customer data")
+        self.assertEqual(row["status"], "verified_resolved")
+        self.assertEqual(row["error_code"], "ERR_LOCK")
+        self.assertEqual(row["subsystem"], "[RESTRICTED]")
+        self.assertEqual(row["resolution"], "[RESTRICTED]")
+        self.assertNotIn("call the vendor", json.dumps(row))
+        # A secret is not echoed back by the browse rows either.
+        leaked = self.record(title=f"leaked {SECRETS['github_token']} here", scope="leaky")
+        rows = server.list_incidents(incident_id=leaked["incident_id"])["incidents"]
+        self.assertIn("[REDACTED:secret:github_token]", rows[0]["title"])
+        self.assertNotIn(SECRETS["github_token"], json.dumps(rows))
+
+    def test_git_union_note_and_kb_exclusion(self) -> None:
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        subprocess.run(["git", "init"], cwd=self.root, check=True, capture_output=True)
+        (self.root / "src").mkdir()
+        (self.root / "src" / "app.py").write_text("x\n")
+        subprocess.run(["git", "add", "-A"], cwd=self.root, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=self.root, check=True,
+                       capture_output=True, env=env)
+        (self.root / "src" / "app.py").write_text("y\n")
+        pf = server.preflight_check(self.summary())
+        self.assertEqual(pf["git_note"], "")
+        self.assertIn("src/app.py", pf["git_files"])
+        # The KB's own files are untracked state, not a change: git shows them, the
+        # union does not, so they can never seed files_touched or match a rule.
+        (self.root / "kb" / "kb.sqlite3-wal").write_bytes(b"state\n")
+        (self.root / "art").mkdir(exist_ok=True)
+        (self.root / "art" / "invariants.json").write_text("{}\n")
+        untracked = subprocess.run(["git", "ls-files", "--others", "--exclude-standard"],
+                                   cwd=self.root, capture_output=True, text=True,
+                                   check=True).stdout.split()
+        self.assertIn("kb/kb.sqlite3-wal", untracked)
+        self.assertIn("art/invariants.json", untracked)
+        pf = server.preflight_check(self.summary())
+        self.assertFalse([f for f in pf["git_files"] if f.startswith(("kb/", "art/"))],
+                         pf["git_files"])
+        # Inside the work tree but not at its root: the union is skipped out loud.
+        try:
+            os.chdir(self.root / "src")
+            skipped = server.preflight_check(self.summary(files_touched=["src/app.py"]))
+            self.assertEqual(skipped["git_files"], [])
+            self.assertIn("not the git work-tree root", skipped["git_note"])
+        finally:
+            os.chdir(self.root)
+
     def test_stdio_startup(self) -> None:
         kb = self.root / "stdio-kb"
         art = self.root / "stdio-art"
         asyncio.run(asyncio.wait_for(self._stdio(kb, art), 20))
         con = sqlite3.connect(kb / "kb.sqlite3")
         try:
-            self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], 4)
         finally:
             con.close()
 
@@ -774,7 +964,7 @@ class MVP(unittest.TestCase):
                 names = sorted(t.name for t in listed.tools)
                 self.assertEqual(names, [
                     "activate_rule", "compile_artifacts", "deprecate_rule", "get_incident_details",
-                    "list_active_invariants", "preflight_check", "preflight_stats",
+                    "list_active_invariants", "list_incidents", "preflight_check", "preflight_stats",
                     "record_failure", "verify_resolution",
                 ])
                 # Every tool must publish all four behaviour hints as explicit booleans.
@@ -788,6 +978,9 @@ class MVP(unittest.TestCase):
                 by_name = {t.name: t.annotations for t in listed.tools}
                 self.assertTrue(by_name["get_incident_details"].readOnlyHint)
                 self.assertTrue(by_name["preflight_stats"].readOnlyHint)
+                self.assertTrue(by_name["list_incidents"].readOnlyHint)
+                # list_active_invariants refreshes staleness, which is a write.
+                self.assertFalse(by_name["list_active_invariants"].readOnlyHint)
                 self.assertFalse(by_name["record_failure"].readOnlyHint)
                 self.assertTrue(by_name["record_failure"].idempotentHint)
                 self.assertTrue(by_name["deprecate_rule"].destructiveHint)

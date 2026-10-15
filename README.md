@@ -58,6 +58,8 @@ What that buys you:
 
 DFIU stores **what happened**, not what the agent expects. Do not call `record_failure` or `verify_resolution` from a theory, a plan, or a belief that the last edit worked.
 
+That applies to the fix as much as to the failure. A diagnosis, a direction, a "it is probably A" — from reading code, from reverse engineering, from a hunch — is a **proposal**, not a resolution. `suspected_cause` and `proposed_resolution` land in the incident's `proposed_*` columns and stay there. The incident's `root_cause` and `resolution` stay empty until an **effective pass** writes them, and `resolution_confirmed` says which of the two you are reading. A proposed invariant is a `hypothesis` rule: it appears in `hypothesis_matches`, never in `matches`, and it cannot reach `active` without an effective verification and a named reviewer.
+
 The user says whether it works or it does not. **That sentence is the fact.** Write it first. Then make the fix, or continue the flow. A preflight reads rules; it does not invent an incident. `dfiu recall` prints drafts; it does not write them.
 
 ---
@@ -70,6 +72,7 @@ record_failure          incident = open
         ▼
 verify_resolution       pass with real evidence
         │               incident = verified_resolved
+        │               resolution/root_cause = the confirmed fix
         │               linked rule = verified
         ▼
 activate_rule           a named reviewer promotes it
@@ -117,23 +120,39 @@ Anything weaker is stored, and `pending_requirements` says what is still missing
 
 ## 🛠️ Tools
 
-Nine tools. Success is `{"ok": true, ...}`. Failure is `{"ok": false, "error": {"code", "message", "fields"}}` and **never** includes a traceback, a filesystem path, or SQL.
+Ten tools. Success is `{"ok": true, ...}`. Failure is `{"ok": false, "error": {"code", "message", "fields"}}` and **never** includes a traceback, a filesystem path, or SQL.
 
 | Tool | What it does |
 | --- | --- |
 | 🩹 `record_failure` | Opens an incident. If you also send a proposed invariant, you must send the action, the condition, and the scope; that creates a `hypothesis` rule linked to the incident. The rule's `dependency_paths` default to the files named in `touches_any`/`touches_all` of the condition (an explicit `dependency_paths` list wins). A repeat of an earlier incident — same `project` and `condition_hash`, or a near-identical title — adds a `possible recurrence of incident <id>` warning; the call still succeeds. |
-| ✅ `verify_resolution` | Appends a verification. An effective pass resolves the incident and moves a linked hypothesis to `verified`. It never activates a rule. |
+| ✅ `verify_resolution` | Appends a verification. An effective pass resolves the incident, writes `resolution`/`root_cause` as the confirmed truth (the record-time guess stays in `proposed_resolution`/`proposed_root_cause`), moves a linked hypothesis to `verified`, and re-anchors the rule's dependency fingerprint. It never activates a rule. |
 | ⚡ `activate_rule` | `verified` or `stale` → `active`. Requires `reviewer` and `reason`. From `stale`, there must be an effective verification newer than the stale transition, and `revision` increments. `dependency_paths` omitted inherits the paths stored on the rule; an explicit list wins. |
 | 🚫 `deprecate_rule` | Any non-deprecated status → `deprecated`. Requires `reviewer` and `reason`. |
-| 🚦 `preflight_check` | Evaluates a `ChangeSummaryV1` plus the git diff. Returns matches, hypotheses, stale rules, and near-miss variants. An invalid summary returns the expected keys in `error.fields`. |
+| 🚦 `preflight_check` | Evaluates a `ChangeSummaryV1` plus the git diff. Returns matches, hypotheses, stale rules, near-miss variants, and `git_note` — empty when the union ran, otherwise the reason it could not. An invalid summary returns the expected keys in `error.fields`. |
 | 📊 `preflight_stats` | Counts preflights for a project, and how many were later followed by `record_failure` (`recurred`). |
 | 📦 `compile_artifacts` | Refreshes staleness, then writes canonical `invariants.json` and derived `active_rules.md`. |
 | 📋 `list_active_invariants` | Compact inventory of active rules. Optional `scope` and `severity` filters. |
-| 🔎 `get_incident_details` | One incident, by exact id, in bounded sections. Text is redacted again on the way out. The `related_incidents` section (on by default) lists the other incidents sharing the same `condition_hash`. |
+| 🔍 `list_incidents` | Browse/search the memory. Read-only. Filters by exact `incident_id`, by keywords (`query`), or by key fields, and returns compact rows; one row comes back with `next_tool: get_incident_details`. |
+| 🔎 `get_incident_details` | One incident, by exact id, in bounded sections: `summary`, `cause`, `resolution`, `proposal`, `references`, `verification`, `related_incidents`. `resolution` is the confirmed fix only and `proposal` holds the record-time guess, so a guess never reads back as a resolution; `resolution_confirmed` states which one you have. Text is redacted again on the way out. The `related_incidents` section (on by default) lists the other incidents sharing the same `condition_hash`. |
 
 `record_failure` and `verify_resolution` accept `idempotency_key`. The same key and the same request replay the stored response. The same key with a different request returns `idempotency_conflict`.
 
 Every `preflight_check` is appended to `preflight_log`. The next `record_failure` for that project marks still-open rows `recurred`, which is what `preflight_stats` reports. The check itself does not store the raw summary beyond a hash, the file list, and the rule ids that participated.
+
+### 🔍 Looking back
+
+`list_incidents` is the browse entry point, and it only reads:
+
+| Filter | Match |
+| --- | --- |
+| `incident_id` | Exact id. |
+| `project`, `subsystem`, `status`, `condition_hash` | Exact. |
+| `error_code` | Prefix: `ERR_CONN` finds `ERR_CONN_RESET`. |
+| `tag` | Exact tag membership. |
+| `since` | `created_at >=` an ISO stamp. |
+| `query` | Whitespace-split terms. **Every** term must appear in some searched field. |
+
+Filters combine with AND. With no filter at all it lists the most recent incidents, newest first. `limit` is clamped to `1..100`, and `truncated` says whether more exist. A row carries id, project, status, redacted title, `created_at`, subsystem, `error_code`, `condition_hash`, tags, and a short redacted resolution; exactly one row adds `next_tool: get_incident_details`. Matching is literal — LIKE metacharacters in a term are escaped, so `%` searches for a percent sign instead of matching everything. It never refreshes staleness and never writes: the write happens in `preflight_check`, `compile_artifacts`, and `list_active_invariants`.
 
 ### 🚦 Preflight status
 
@@ -202,7 +221,7 @@ Every `invalid_condition` error carries `fields` with a one-line grammar example
 
 `preflight_check`, `list_active_invariants`, and `compile_artifacts` refresh staleness first. An active rule becomes `stale` when `valid_until` or `review_after` has passed, or when the `dependency_fingerprint` no longer matches.
 
-The fingerprint is declared at activation as a list of repo-relative files. It is the sha256 of each normalized path plus the sha256 of that file's bytes (`MISSING` if the file is gone), in sorted order. A rule with no dependency paths only expires by date.
+The fingerprint covers a rule's repo-relative `dependency_paths`. It is the sha256 of each normalized path plus the sha256 of that file's bytes (`MISSING` if the file is gone), in sorted order. It is anchored by the **last effective verification** and re-stamped at activation, so `activate_rule` refuses with `verification_required` when the declared paths or the contents behind them changed after the verification that justifies the rule (redeclaring `dependency_paths` in that call counts as a change: verify again, then promote). Without that guard a `verified` rule could be promoted on evidence that predates the change, since the staleness refresh only walks `active` rules. A rule with no dependency paths only expires by date.
 
 Dependencies usually declare themselves: `record_failure` seeds the rule's `dependency_paths` with the file paths named in `touches_any`/`touches_all` of the condition, and `activate_rule` with no `dependency_paths` inherits those instead of wiping them. An explicit `dependency_paths` list — at record time or at activation — always wins. A path that escapes the project is rejected as `invalid_input` with `dependency_paths` in `fields`.
 
@@ -221,6 +240,8 @@ Only `active` rules are compiled. Pass `write: false` to compute the hash withou
 
 Free text is scrubbed before it is stored, and `get_incident_details` redacts again on output. High-confidence matches become `[REDACTED:secret:<kind>]`.
 
+Condition values are scrubbed too: a condition is persisted in `rules.condition_json` and compiled into `invariants.json`, so a secret cannot ride into the KB or the shareable artifact inside one. Every string in a condition is also capped at `200` characters — the grammar bounds depth and node count, not length — and an over-long value is rejected as `too_large`.
+
 | Secret type | Secret type |
 | --- | --- |
 | Private keys | AWS access keys |
@@ -228,7 +249,7 @@ Free text is scrubbed before it is stored, and `get_incident_details` redacts ag
 | JWTs | `Authorization` headers |
 | URLs with embedded credentials | Assignments whose name looks like a password, secret, token, or API key |
 
-High-entropy strings (Shannon entropy ≥ 4.0 bits/character, length ≥ 20) are **not** rewritten. The response carries a warning and does not echo the candidate. If anything was redacted, the incident's `sensitivity` is `redacted`. A `restricted` incident is supposed to return only `title`, `status`, and `error_code`.
+High-entropy strings (Shannon entropy ≥ 4.0 bits/character, length ≥ 20) are **not** rewritten. The response carries a warning and does not echo the candidate. If anything was redacted, the incident's `sensitivity` is `redacted`. A `restricted` incident returns only `title`, `status`, and `error_code` from `get_incident_details` and `list_incidents`; its symptom, subsystem, root cause, resolution, and evidence come back as `[RESTRICTED]`. Nothing writes that status yet — `record_failure` writes `normal`, or `redacted` when a secret pattern fired — so a restricted row is a deliberate manual `UPDATE` today.
 
 Legitimate technical tokens never raise that warning: `0x`-prefixed hex addresses (4–16 hex digits, like `0x0304F298`), standalone git hashes (7–40 hex chars), and strings prefixed `sha256:` or `md5:`. The allowlist only silences the low-confidence entropy warning; every secret pattern in the catalog above is still redacted, and a real high-entropy string still warns.
 
@@ -334,7 +355,7 @@ The draft keys are exactly `record_failure` arguments. `project` is the repo dir
 .venv/bin/python -m unittest test_mvp test_install
 ```
 
-`test_mvp.py` walks the happy path: record, verify, activate, preflight, artifacts, idempotency, and the git-union behavior on ASCII paths, plus the error hints, the entropy allowlist, dependency auto-suggestion, and recurrence families. `test_install.py` checks that install and uninstall touch only the `dfiu` entry, and that `dfiu recall` prints drafts while writing nothing.
+`test_mvp.py` walks the happy path: record, verify, activate, preflight, artifacts, idempotency, and the git-union behavior on ASCII paths, plus the error hints, the entropy allowlist, dependency auto-suggestion, and recurrence families. It also covers condition scrubbing and its size cap, confirmed-vs-proposed resolution, the dependency-move activation guard, the git union's skip note and KB exclusion, and browsing by id, keywords, key fields, `since`, `limit`, restricted masking, and literal LIKE matching. `test_install.py` checks that install and uninstall touch only the `dfiu` entry, and that `dfiu recall` prints drafts while writing nothing.
 
 ---
 
@@ -348,6 +369,10 @@ The draft keys are exactly `record_failure` arguments. `project` is the repo dir
 6. Errors never carry a traceback, a filesystem path, or SQL. `invalid_condition` and invalid-summary errors carry schema hints in `fields`, so the contract is discoverable from the error alone.
 7. Technical tokens (`0x` addresses, git hashes, `sha256:`/`md5:` digests) never raise the entropy warning. Real secrets still redact.
 8. A recurrence warning is a warning: `record_failure` still succeeds, and `get_incident_details` still returns the family in `related_incidents`.
+9. A guess never reads back as a fact: `resolution`/`root_cause` are written only by an effective pass, and `resolution_confirmed` tells the caller which text it has.
+10. A secret cannot reach disk through a condition, and a condition string longer than `200` characters is rejected before anything is written.
+11. `preflight_check` says when the git union could not run (`git_note`) instead of silently checking less, and the KB's own database and artifacts never appear in `git_files`.
+12. `list_incidents` is genuinely read-only (no staleness refresh, no log row), matches keywords literally instead of as wildcards, and masks a restricted incident's body on the way out.
 
 ---
 

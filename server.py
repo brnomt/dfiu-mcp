@@ -33,6 +33,7 @@ MAX_MATCHES = 5
 PREFLIGHT_WINDOW_SECONDS = 1800  # 30 minutes
 ENTROPY_THRESHOLD = 4.0      # bits/char, candidates at least 20 characters
 ENTROPY_MIN_LEN = 20
+MAX_CONDITION_VALUE = 200    # per-string cap inside a condition, like the other text fields
 CHANGE_TYPES = {"code", "config", "dependency", "schema", "infra", "firmware", "docs", "test"}
 SEVERITIES = {"info", "warning", "blocker"}
 
@@ -56,6 +57,10 @@ INSTRUCTIONS = (
     "(promote a verified rule) -> compile_artifacts (write the shareable invariants). Each "
     "response carries the next step in a 'next_step' or 'next_tool' field; follow it. "
     "A hypothesis or an operator_review is never a pass.\n"
+    "TO LOOK BACK: list_incidents browses the memory by exact id, by keywords, or by key "
+    "fields (project, subsystem, status, error_code, condition_hash, tag, since). Use it "
+    "when you need to know whether this already failed; use get_incident_details for the "
+    "full write-up of one incident.\n"
     "HOOKS: if your client supports hooks, wire a pre-edit or pre-change hook to call preflight_check "
     "and a confirmation hook to call record_failure/verify_resolution. Keep those hooks generic: key "
     "them off the KB's own history (the files and rules it already tracks), never off a hardcoded "
@@ -203,6 +208,23 @@ def scrub(name: str, value: str, limit: int, warnings: list[str]) -> str:
     return value
 
 
+def sanitize_condition(node: Any, warnings: list[str]) -> Any:
+    """Same scrub as every other stored text, applied to every string in a condition.
+
+    A condition is persisted in rules.condition_json and compiled into invariants.json,
+    so it must not be the one path that smuggles a secret into the KB or the artifact.
+    Values are also capped at MAX_CONDITION_VALUE characters: the grammar bounds depth
+    and node count, not the length of a string. Structure is untouched.
+    """
+    if isinstance(node, str):
+        return scrub("condition", node, MAX_CONDITION_VALUE, warnings)
+    if isinstance(node, list):
+        return [sanitize_condition(x, warnings) for x in node]
+    if isinstance(node, dict):
+        return {k: sanitize_condition(v, warnings) for k, v in node.items()}
+    return node
+
+
 # ---------- database ----------
 MIGRATIONS: list[str] = [
     # v1
@@ -290,6 +312,17 @@ MIGRATIONS: list[str] = [
     ALTER TABLE verification_log DROP COLUMN source_revision;
     ALTER TABLE verification_log DROP COLUMN condition_hash;
     ALTER TABLE verification_log DROP COLUMN metadata_json;
+    """,
+    # v4: separate the *proposed* fix from the *confirmed* one. Until now the agent's
+    # proposed_resolution was written into incidents.resolution, so a confirmed fix
+    # had nowhere to land and a guess read back as if it were the resolution. The
+    # guess moves to its own columns; resolution/root_cause now hold only what an
+    # effective verification confirmed. Existing rows move with the same split.
+    """
+    ALTER TABLE incidents ADD COLUMN proposed_resolution TEXT;
+    ALTER TABLE incidents ADD COLUMN proposed_root_cause TEXT;
+    UPDATE incidents SET proposed_resolution=resolution, proposed_root_cause=root_cause;
+    UPDATE incidents SET resolution=NULL, root_cause=NULL;
     """,
 ]
 
@@ -617,7 +650,8 @@ def record_failure(project: str, title: str, symptom: str, subsystem: str = "",
                    dependency_paths: list[str] | None = None,
                    idempotency_key: str = "") -> dict:
     """Open an incident from a fact the user confirmed. Never from a guess that something failed.
-    Optionally attach a hypothesis rule. dependency_paths default to the files in touches_any/touches_all."""
+    Optionally attach a hypothesis rule. dependency_paths default to the files in touches_any/touches_all.
+    suspected_cause and proposed_resolution are stored as proposals; only verify_resolution confirms a fix."""
     request = {k: v for k, v in locals().items() if k != "idempotency_key"}
     warnings: list[str] = []
     with tx() as (c, t):
@@ -632,13 +666,16 @@ def record_failure(project: str, title: str, symptom: str, subsystem: str = "",
         prior = find_recurrence(c, bounded("project", project, 160), condition_hash or "", title_s)
         if prior:
             warnings.append(f"possible recurrence of incident {prior}")
+        # root_cause/resolution stay NULL: nothing is confirmed yet. The guess lives in
+        # the proposed_* columns until an effective verify_resolution writes the truth.
         c.execute("""INSERT INTO incidents(id,created_at,updated_at,project,subsystem,environment,
-            title,symptom,error_code,condition_hash,root_cause,resolution,status,
-            evidence_summary,tags_json,sensitivity) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            title,symptom,error_code,condition_hash,proposed_root_cause,proposed_resolution,
+            status,evidence_summary,tags_json,sensitivity) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (incident_id, t, t, bounded("project", project, 160), subsystem or None,
              environment or None, title_s,
              scrub("symptom", symptom, 2000, warnings), error_code or None,
-             condition_hash or None, scrub("suspected_cause", suspected_cause, 1000, warnings) or None,
+             condition_hash or None,
+             scrub("suspected_cause", suspected_cause, 1000, warnings) or None,
              scrub("proposed_resolution", proposed_resolution, 1000, warnings) or None, "open",
              scrub("evidence_summary", evidence_summary, 1000, warnings) or None,
              canonical_json(tags_s), "redacted" if any(": redacted " in w for w in warnings) else "normal"))
@@ -652,6 +689,7 @@ def record_failure(project: str, title: str, symptom: str, subsystem: str = "",
             if severity not in SEVERITIES:
                 raise KBError("invalid_input", "invalid severity", ["severity"])
             validate_condition(condition)
+            condition = sanitize_condition(condition, warnings)
             inv = scrub("proposed_invariant", proposed_invariant, 200, warnings)
             act = scrub("proposed_action", proposed_action, 200, warnings)
             # Dependency auto-suggestion: touches_any/touches_all on files_touched
@@ -698,8 +736,13 @@ def record_failure(project: str, title: str, symptom: str, subsystem: str = "",
 def verify_resolution(incident_id: str, verdict: str, method: str, success_criterion: str,
                       preconditions: dict[str, str], exercised_failing_path: bool,
                       evidence_summary: str, rule_id: str = "", environment: str = "",
-                      reviewer: str = "", idempotency_key: str = "") -> dict:
-    """Append evidence the user confirmed by actually trying it. An effective pass needs a criterion, all preconditions passing, and the failing path exercised. Do not call this because you assume the fix worked."""
+                      reviewer: str = "", resolution: str = "", root_cause: str = "",
+                      idempotency_key: str = "") -> dict:
+    """Append evidence the user confirmed by actually trying it. An effective pass needs a criterion, all preconditions passing, and the failing path exercised. Do not call this because you assume the fix worked.
+    On an effective pass, resolution and root_cause are written to the incident as the
+    confirmed truth (the record-time text stays in proposed_resolution/proposed_root_cause).
+    The linked rule's dependency anchor is re-stamped, so activation later refuses if a
+    dependency moves after this verification."""
     request = {k: v for k, v in locals().items() if k != "idempotency_key"}
     if verdict not in {"pass", "fail", "inconclusive"}:
         raise KBError("invalid_input", "invalid verdict", ["verdict"])
@@ -746,10 +789,24 @@ def verify_resolution(incident_id: str, verdict: str, method: str, success_crite
             new_inc = "reopened"
         if new_inc != inc["status"]:
             c.execute("UPDATE incidents SET status=?, updated_at=? WHERE id=?", (new_inc, t, incident_id))
+        # The confirmed fix overwrites the incident's resolution; the record-time guess
+        # stays in proposed_resolution. Empty strings change nothing.
+        confirmed = [(column, provided) for column, provided in
+                     (("resolution", resolution), ("root_cause", root_cause)) if provided.strip()]
+        if effective and confirmed:
+            assigns = ", ".join(f"{column}=?" for column, _ in confirmed)
+            values = [scrub(column, provided, 1000, warnings) for column, provided in confirmed]
+            c.execute(f"UPDATE incidents SET {assigns}, updated_at=? WHERE id=?",
+                      (*values, t, incident_id))
         rule_status = rule["status"] if rule else None
         if rule is not None and effective:
-            c.execute("UPDATE rules SET last_verified_at=?, updated_at=? WHERE id=?",
-                      (t, t, rule_id))
+            # Anchor the rule's dependency fingerprint to *this* verification, so a
+            # later dependency change is detectable at activation even while the rule
+            # is still only 'verified' (refresh_staleness only scans 'active' rules).
+            rule_paths = json.loads(rule["dependency_paths_json"])
+            anchor = dependency_fingerprint(rule_paths) if rule_paths else None
+            c.execute("UPDATE rules SET last_verified_at=?, dependency_fingerprint=?, updated_at=? "
+                      "WHERE id=?", (t, anchor, t, rule_id))
             if rule["status"] == "hypothesis":
                 transition(c, rule, "verified", "verify_resolution pass", reviewer, t)
                 rule_status = "verified"
@@ -761,10 +818,12 @@ def verify_resolution(incident_id: str, verdict: str, method: str, success_crite
         inc_project = c.execute("SELECT project FROM incidents WHERE id=?", (incident_id,)).fetchone()
         if inc_project and not had_recent_preflight(c, inc_project["project"], t):
             warnings.append(f"no preflight_check preceded this change for project {inc_project['project']}")
+        if effective and not resolution.strip():
+            warnings.append("resolution not recorded: send `resolution` with the confirmed fix")
         response = {"ok": True, "incident_id": incident_id, "verdict": verdict,
                     "effective_pass": effective, "incident_status": new_inc,
-                    "rule_status": rule_status, "pending_requirements": pending,
-                    "warnings": warnings}
+                    "rule_status": rule_status, "resolution_confirmed": bool(resolution.strip()),
+                    "pending_requirements": pending, "warnings": warnings}
         remember(c, "verify_resolution", idempotency_key, request, response, t)
         return response
 
@@ -797,6 +856,15 @@ def activate_rule(rule_id: str, reviewer: str, reason: str, dependency_paths: li
             dependency_paths = json.loads(r["dependency_paths_json"])
         paths = sorted(set(norm_path(p) for p in (dependency_paths or [])))
         fp = dependency_fingerprint(paths) if paths else None
+        # A 'verified' rule is not scanned by refresh_staleness (it only walks active
+        # rules), so the anchor is the only thing that can notice a dependency moved
+        # between verification and activation. A moved anchor means the evidence no
+        # longer covers the current dependency state: verify again, then promote.
+        if r["dependency_fingerprint"] is not None and fp != r["dependency_fingerprint"]:
+            raise KBError("verification_required",
+                          "dependencies changed since the last effective verification; "
+                          "call verify_resolution again",
+                          ["verify_resolution", "dependency_paths"])
         rev = r["revision"] + (1 if r["status"] == "stale" else 0)
         h = rule_hash(r["project"], r["scope"], json.loads(r["condition_json"]), r["invariant"],
                       r["action"], sev)
@@ -873,7 +941,10 @@ def compile_artifacts(project: str, write: bool = True) -> dict:
                 "written": write, "files": ["invariants.json", "active_rules.md"] if write else []}
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False,
+# readOnlyHint is false on purpose: refreshing staleness is a write (an expired rule is
+# transitioned to 'stale' and journalled). A host that needs a strictly non-writing call
+# should use preflight_stats or get_incident_details instead.
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False,
                                      idempotentHint=True, openWorldHint=False))
 @tool_guard
 def list_active_invariants(project: str, scope: str = "", severity: str = "",
@@ -911,8 +982,24 @@ def _git(root: Path, args: list[str]) -> list[str] | None:
     return [ln.strip().replace("\\", "/") for ln in proc.stdout.splitlines() if ln.strip()]
 
 
+def _kb_prefixes_under(root: Path) -> tuple[str, ...]:
+    """Project-relative prefixes of the KB's own directories, when they sit under root.
+    The database, its WAL sidecars, and the compiled artifacts are state, not a change."""
+    prefixes = []
+    for d in (KB_DIR, ARTIFACT_DIR):
+        try:
+            rel = d.resolve().relative_to(root.resolve())
+        except (ValueError, OSError):
+            continue
+        if rel.parts:
+            prefixes.append(str(PurePosixPath(*rel.parts)).strip("/") + "/")
+    return tuple(sorted(set(prefixes)))
+
+
 def git_changes(root: Path = Path(".")) -> list[str] | None:
-    """Names from git diff when cwd is the work-tree root. None when it is not a repo."""
+    """Names from git diff when cwd is the work-tree root. None when it is not a repo,
+    or when the cwd is inside a repo but not at its root (the union then cannot run).
+    The KB's own files are filtered out so they never count as changed source."""
     if _git(root, ["rev-parse", "--is-inside-work-tree"]) != ["true"]:
         return None
     top = _git(root, ["rev-parse", "--show-toplevel"])
@@ -922,7 +1009,8 @@ def git_changes(root: Path = Path(".")) -> list[str] | None:
     for args in (["diff", "--name-only"], ["diff", "--name-only", "--cached"],
                  ["ls-files", "--others", "--exclude-standard"]):
         files.update(_git(root, args) or [])
-    return sorted(files)
+    blocked = _kb_prefixes_under(root)
+    return sorted(f for f in files if not f.startswith(blocked))
 
 
 def infer_change_types(paths: list[str]) -> list[str]:
@@ -950,19 +1038,29 @@ def infer_change_types(paths: list[str]) -> list[str]:
     return sorted(out & CHANGE_TYPES)
 
 
-def enrich_summary(summary: dict[str, Any], root: Path = Path(".")) -> tuple[dict[str, Any], list[str]]:
-    """Union of the agent's summary and the git diff. The agent may add files. It cannot hide files git already shows."""
+GIT_SKIPPED_NOTE = ("git union skipped: cwd is not the git work-tree root, so "
+                    "files_touched holds only what the caller sent")
+
+
+def enrich_summary(summary: dict[str, Any], root: Path = Path(".")) -> tuple[dict[str, Any], list[str], str]:
+    """Union of the agent's summary and the git diff. The agent may add files. It cannot
+    hide files git already shows. Returns (summary, git files, note); the note is non-empty
+    when the union could not run even though the directory is inside a git work tree, so a
+    silently weakened check is never mistaken for a clean one."""
     summary = dict(summary)
-    found = git_changes(root) or []
+    found = git_changes(root)
+    if found is None:
+        in_repo = _git(root, ["rev-parse", "--is-inside-work-tree"]) == ["true"]
+        return summary, [], GIT_SKIPPED_NOTE if in_repo else ""
     if not found:
-        return summary, []
+        return summary, [], ""
     given = summary.get("files_touched")
     summary["files_touched"] = [*(given if isinstance(given, list) else []), *found]
     types = summary.get("change_type")
     extra = infer_change_types(found)
     if extra:
         summary["change_type"] = [*(types if isinstance(types, list) else []), *extra]
-    return summary, found
+    return summary, found, ""
 
 
 def _walk(node: Any, acc: set[str], field: str, ops: set[str]) -> None:
@@ -1020,7 +1118,7 @@ def variant_note(condition: dict[str, Any], s: dict[str, Any]) -> str | None:
 @tool_guard
 def preflight_check(summary: dict[str, Any], limit: int = MAX_MATCHES) -> dict:
     """Evaluate a ChangeSummaryV1. Git names are merged in. Hypotheses and variants warn. They do not block."""
-    summary, git_files = enrich_summary(summary)
+    summary, git_files, git_note = enrich_summary(summary)
     try:
         s, missing_fields = normalize_summary(summary)
     except KBError as e:
@@ -1085,7 +1183,7 @@ def preflight_check(summary: dict[str, Any], limit: int = MAX_MATCHES) -> dict:
                                "note": "needs revalidation"} for m in stale_hits[:limit]],
             "variant_matches": variants[:limit],
             "evaluated": len(rows), "missing_fields": missing_all,
-            "artifact_sha256": sha256(js), "git_files": git_files,
+            "artifact_sha256": sha256(js), "git_files": git_files, "git_note": git_note,
             "next_tool": "get_incident_details" if heard else None}
 
 
@@ -1112,6 +1210,7 @@ def preflight_stats(project: str) -> dict:
 
 SECTIONS = {"summary": ("title", "symptom", "error_code", "status", "subsystem", "environment"),
             "cause": ("root_cause",), "resolution": ("resolution",),
+            "proposal": ("proposed_root_cause", "proposed_resolution"),
             "references": ("evidence_summary", "evidence_ref")}
 
 
@@ -1133,9 +1232,11 @@ def _related_row(x: sqlite3.Row, max_chars: int) -> dict[str, Any]:
 def get_incident_details(incident_id: str, sections: list[str] | None = None,
                          max_chars: int = 2000) -> dict:
     """Bounded detail for one incident, looked up by exact id. Text is redacted again.
-    related_incidents lists other incidents sharing the same condition_hash."""
-    sections = sorted(set(sections or ["summary", "cause", "resolution", "verification",
-                                       "related_incidents"]))
+    related_incidents lists other incidents sharing the same condition_hash.
+    resolution is the confirmed fix only (empty until an effective verify_resolution); the
+    record-time guess is under proposed_resolution. resolution_confirmed states which."""
+    sections = sorted(set(sections or ["summary", "cause", "resolution", "proposal",
+                                       "verification", "related_incidents"]))
     bad = set(sections) - set(SECTIONS) - {"verification", "related_incidents"}
     if bad:
         raise KBError("invalid_input", f"invalid sections: {sorted(bad)}", ["sections"])
@@ -1155,7 +1256,8 @@ def get_incident_details(incident_id: str, sections: list[str] | None = None,
     finally:
         c.close()
     restricted = row["sensitivity"] == "restricted"
-    out: dict[str, Any] = {"ok": True, "incident_id": incident_id, "sensitivity": row["sensitivity"]}
+    out: dict[str, Any] = {"ok": True, "incident_id": incident_id, "sensitivity": row["sensitivity"],
+                           "resolution_confirmed": row["status"] == "verified_resolved"}
     for sec in sections:
         if sec == "related_incidents":
             out["related_incidents"] = [_related_row(x, max_chars) for x in related]
@@ -1173,6 +1275,100 @@ def get_incident_details(incident_id: str, sections: list[str] | None = None,
             else:
                 out[key] = redact(str(val))[0][:max_chars]
     return out
+
+
+INCIDENT_STATUSES = ("open", "change_applied_unverified", "verified_resolved",
+                     "reopened", "closed")
+# Fields a keyword is matched against, with AND between terms and OR across fields.
+SEARCH_FIELDS = ("title", "symptom", "error_code", "subsystem", "root_cause", "resolution",
+                 "proposed_root_cause", "proposed_resolution", "evidence_summary", "tags_json")
+MAX_SEARCH_TERMS = 8
+
+
+def escape_like(value: str) -> str:
+    """Escape LIKE metacharacters so a keyword or tag is matched literally."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _browse_row(x: sqlite3.Row, max_chars: int) -> dict[str, Any]:
+    """One browse row: identity, key fields, tags, and a short redacted resolution.
+    A restricted incident exposes title, status, and error_code only, like get_incident_details."""
+    hidden = x["sensitivity"] == "restricted"
+    short = min(max_chars, 200)
+    subsystem = x["subsystem"]
+    if hidden and subsystem is not None:
+        subsystem = "[RESTRICTED]"
+    resolution = x["resolution"]
+    if resolution is not None:
+        resolution = "[RESTRICTED]" if hidden else redact(resolution)[0][:short]
+    return {"id": x["id"], "project": x["project"], "status": x["status"],
+            "title": redact(x["title"])[0][:short], "created_at": x["created_at"],
+            "subsystem": subsystem, "error_code": x["error_code"],
+            "condition_hash": x["condition_hash"], "tags": json.loads(x["tags_json"]),
+            "resolution": resolution}
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False,
+                                     idempotentHint=True, openWorldHint=False))
+@tool_guard
+def list_incidents(project: str = "", query: str = "", incident_id: str = "", subsystem: str = "",
+                   status: str = "", error_code: str = "", condition_hash: str = "", tag: str = "",
+                   since: str = "", limit: int = 20, max_chars: int = 200) -> dict:
+    """Browse the incident memory: by exact id, by keywords, or by key fields. Read-only.
+    Filters combine with AND. incident_id/project/subsystem/status/condition_hash are exact,
+    error_code is a prefix, tag is exact membership, since is created_at >= an ISO stamp.
+    query is split on whitespace and every term must appear in some searched field.
+    With no filter at all it lists the most recent incidents. Rows are compact: use
+    get_incident_details for the full write-up behind an id."""
+    limit = max(1, min(limit, 100))
+    max_chars = max(200, min(max_chars, 2000))
+    where: list[str] = []
+    args: list[Any] = []
+    if incident_id:
+        where.append("id=?")
+        args.append(bounded("incident_id", incident_id, 100))
+    if project:
+        where.append("project=?")
+        args.append(bounded("project", project, 160))
+    if subsystem:
+        where.append("subsystem=?")
+        args.append(bounded("subsystem", subsystem, 200))
+    if status:
+        if status not in INCIDENT_STATUSES:
+            raise KBError("invalid_input", f"status must be one of {list(INCIDENT_STATUSES)}",
+                          ["status"])
+        where.append("status=?")
+        args.append(status)
+    if error_code:
+        where.append("error_code LIKE ? ESCAPE '\\'")
+        args.append(escape_like(bounded("error_code", error_code, 200)) + "%")
+    if condition_hash:
+        where.append("condition_hash=?")
+        args.append(bounded("condition_hash", condition_hash, 200))
+    if tag:
+        where.append("tags_json LIKE ? ESCAPE '\\'")
+        args.append(f'%"{escape_like(bounded("tag", tag, 60))}"%')
+    if since:
+        where.append("created_at>=?")
+        args.append(bounded("since", since, 40))
+    for term in bounded("query", query, 400).split()[:MAX_SEARCH_TERMS]:
+        pattern = f"%{escape_like(term)}%"
+        where.append("(" + " OR ".join(
+            f"COALESCE({field},'') LIKE ? ESCAPE '\\'" for field in SEARCH_FIELDS) + ")")
+        args.extend([pattern] * len(SEARCH_FIELDS))
+    sql = "SELECT * FROM incidents"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY created_at DESC, id LIMIT ?"
+    args.append(limit + 1)          # one extra row tells us whether we truncated
+    c = _open()
+    try:
+        rows = c.execute(sql, tuple(args)).fetchall()
+    finally:
+        c.close()
+    return {"ok": True, "count": min(len(rows), limit), "truncated": len(rows) > limit,
+            "incidents": [_browse_row(x, max_chars) for x in rows[:limit]],
+            "next_tool": "get_incident_details" if len(rows) == 1 else None}
 
 
 if __name__ == "__main__":
