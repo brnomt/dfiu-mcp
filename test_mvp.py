@@ -777,6 +777,22 @@ class MVP(unittest.TestCase):
                     "list_active_invariants", "preflight_check", "preflight_stats",
                     "record_failure", "verify_resolution",
                 ])
+                # Every tool must publish all four behaviour hints as explicit booleans.
+                # A missing or null hint is what hosts and directory reviews reject.
+                for tool in listed.tools:
+                    ann = tool.annotations
+                    self.assertIsNotNone(ann, f"{tool.name}: no annotations")
+                    for hint in ("readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"):
+                        self.assertIsInstance(getattr(ann, hint, None), bool,
+                                              f"{tool.name}: {hint} is not an explicit boolean")
+                by_name = {t.name: t.annotations for t in listed.tools}
+                self.assertTrue(by_name["get_incident_details"].readOnlyHint)
+                self.assertTrue(by_name["preflight_stats"].readOnlyHint)
+                self.assertFalse(by_name["record_failure"].readOnlyHint)
+                self.assertTrue(by_name["record_failure"].idempotentHint)
+                self.assertTrue(by_name["deprecate_rule"].destructiveHint)
+                for tool in listed.tools:
+                    self.assertFalse(tool.annotations.openWorldHint)
                 schema = next(t for t in listed.tools if t.name == "record_failure").inputSchema
                 self.assertIn("project", schema["properties"])
                 result = await session.call_tool("record_failure", {

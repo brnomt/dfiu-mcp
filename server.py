@@ -17,6 +17,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterator
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 KB_DIR = Path(os.environ.get("FAILURE_KB_DIR", ".dfiu"))
 DB = KB_DIR / "kb.sqlite3"
@@ -600,7 +601,11 @@ def find_recurrence(c: sqlite3.Connection, project: str, condition_hash: str,
 
 
 # ---------- tools ----------
-@mcp.tool()
+# Every tool states all four behaviour hints explicitly. ToolAnnotations leaves them
+# unset by default, and hosts (and directory reviews) need a concrete boolean for each
+# one before they can warn the user about what a call will do.
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False,
+                                     idempotentHint=True, openWorldHint=False))
 @tool_guard
 def record_failure(project: str, title: str, symptom: str, subsystem: str = "",
                    environment: str = "", error_code: str = "", condition_hash: str = "",
@@ -687,7 +692,8 @@ def record_failure(project: str, title: str, symptom: str, subsystem: str = "",
         return response
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False,
+                                     idempotentHint=True, openWorldHint=False))
 @tool_guard
 def verify_resolution(incident_id: str, verdict: str, method: str, success_criterion: str,
                       preconditions: dict[str, str], exercised_failing_path: bool,
@@ -763,7 +769,8 @@ def verify_resolution(incident_id: str, verdict: str, method: str, success_crite
         return response
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False,
+                                     idempotentHint=False, openWorldHint=False))
 @tool_guard
 def activate_rule(rule_id: str, reviewer: str, reason: str, dependency_paths: list[str] | None = None,
                   review_after: str = "", valid_until: str = "",
@@ -803,7 +810,10 @@ def activate_rule(rule_id: str, reviewer: str, reason: str, dependency_paths: li
                 "content_hash": h, "dependency_fingerprint": fp}
 
 
-@mcp.tool()
+# Retiring a rule withdraws a guard other changes relied on, so it is reported as
+# destructive even though the row and its history are kept.
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True,
+                                     idempotentHint=False, openWorldHint=False))
 @tool_guard
 def deprecate_rule(rule_id: str, reason: str, reviewer: str, evidence_ref: str = "") -> dict:
     """Any status except deprecated becomes deprecated. A reason is required. History stays."""
@@ -847,7 +857,8 @@ def atomic_write(path: Path, text: str) -> None:
     os.replace(tmp, path)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False,
+                                     idempotentHint=False, openWorldHint=False))
 @tool_guard
 def compile_artifacts(project: str, write: bool = True) -> dict:
     """Write canonical invariants.json and active_rules.md under ARTIFACT_DIR."""
@@ -862,7 +873,8 @@ def compile_artifacts(project: str, write: bool = True) -> dict:
                 "written": write, "files": ["invariants.json", "active_rules.md"] if write else []}
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False,
+                                     idempotentHint=True, openWorldHint=False))
 @tool_guard
 def list_active_invariants(project: str, scope: str = "", severity: str = "",
                            limit: int = 50) -> dict:
@@ -1003,7 +1015,8 @@ def variant_note(condition: dict[str, Any], s: dict[str, Any]) -> str | None:
     return None
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False,
+                                     idempotentHint=False, openWorldHint=False))
 @tool_guard
 def preflight_check(summary: dict[str, Any], limit: int = MAX_MATCHES) -> dict:
     """Evaluate a ChangeSummaryV1. Git names are merged in. Hypotheses and variants warn. They do not block."""
@@ -1076,7 +1089,8 @@ def preflight_check(summary: dict[str, Any], limit: int = MAX_MATCHES) -> dict:
             "next_tool": "get_incident_details" if heard else None}
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False,
+                                     idempotentHint=True, openWorldHint=False))
 @tool_guard
 def preflight_stats(project: str) -> dict:
     """How many preflights ran, and how many were followed by an incident. It does not count checks that never happened."""
@@ -1113,7 +1127,8 @@ def _related_row(x: sqlite3.Row, max_chars: int) -> dict[str, Any]:
                           ("[RESTRICTED]" if hidden else redact(x["resolution"])[0][:short])}
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False,
+                                     idempotentHint=True, openWorldHint=False))
 @tool_guard
 def get_incident_details(incident_id: str, sections: list[str] | None = None,
                          max_chars: int = 2000) -> dict:
